@@ -11,6 +11,7 @@
     "ssdp"
   ],
   "documentation": "https://github.com/amsound/audiopro_linkplay_hacs",
+  "issue_tracker": "https://github.com/amsound/audiopro_linkplay_hacs/issues",
   "integration_type": "device",
   "iot_class": "local_push",
   "loggers": [
