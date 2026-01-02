@@ -1,0 +1,34 @@
+{
+  "domain": "audiopro_linkplay",
+  "name": "Audio Pro (LinkPlay)",
+  "version": "1.0",
+  "after_dependencies": [
+    "media_source"
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [
+    "ssdp"
+  ],
+  "documentation": "https://www.home-assistant.io/",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "loggers": [
+    "async_upnp_client"
+  ],
+  "requirements": [],
+  "ssdp": [
+    {
+      "deviceType": "urn:schemas-upnp-org:device:MediaRenderer:1",
+      "st": "urn:schemas-upnp-org:device:MediaRenderer:1"
+    },
+    {
+      "deviceType": "urn:schemas-upnp-org:device:MediaRenderer:2",
+      "st": "urn:schemas-upnp-org:device:MediaRenderer:2"
+    },
+    {
+      "deviceType": "urn:schemas-upnp-org:device:MediaRenderer:3",
+      "st": "urn:schemas-upnp-org:device:MediaRenderer:3"
+    }
+  ]
+}
