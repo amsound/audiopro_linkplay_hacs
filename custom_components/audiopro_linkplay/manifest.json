@@ -1,7 +1,7 @@
 {
   "domain": "audiopro_linkplay",
   "name": "Audio Pro (LinkPlay)",
-  "version": "1.0.0",
+  "version": "1.0",
   "config_flow": true,
   "integration_type": "device",
   "iot_class": "local_push",
