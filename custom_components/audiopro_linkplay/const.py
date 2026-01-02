@@ -19,6 +19,13 @@ CONF_CALLBACK_URL_OVERRIDE: Final = "callback_url_override"
 CONF_POLL_AVAILABILITY: Final = "poll_availability"
 CONF_BROWSE_UNFILTERED: Final = "browse_unfiltered"
 
+# How much volume_up/volume_down should adjust volume by.
+# Stored as an integer percent (1..5) in config entry options.
+CONF_VOLUME_STEP_PCT: Final = "volume_step_pct"
+DEFAULT_VOLUME_STEP_PCT: Final = 2
+MIN_VOLUME_STEP_PCT: Final = 1
+MAX_VOLUME_STEP_PCT: Final = 5
+
 DEFAULT_NAME: Final = "Audio Pro (LinkPlay)"
 
 CONNECT_TIMEOUT: Final = 10

@@ -49,7 +49,11 @@ from .const import (
     CONF_CALLBACK_URL_OVERRIDE,
     CONF_LISTEN_PORT,
     CONF_POLL_AVAILABILITY,
+    CONF_VOLUME_STEP_PCT,
     DOMAIN,
+    DEFAULT_VOLUME_STEP_PCT,
+    MAX_VOLUME_STEP_PCT,
+    MIN_VOLUME_STEP_PCT,
     LOGGER as _LOGGER,
     MEDIA_METADATA_DIDL,
     MEDIA_TYPE_MAP,
@@ -1219,6 +1223,51 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_volume_level = vol
         self.async_write_ha_state()
 
+    def _get_volume_step(self) -> float:
+        """Return the configured volume step (0.01..0.05).
+
+        Stored in options as an integer percent (1..5). Be forgiving if the
+        value is stored as a float (0.02) or a string ("2%", "0.02").
+        """
+        raw = self._config_entry.options.get(CONF_VOLUME_STEP_PCT, DEFAULT_VOLUME_STEP_PCT)
+        pct: int
+        if raw is None:
+            pct = DEFAULT_VOLUME_STEP_PCT
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if s.endswith("%"):
+                s = s[:-1].strip()
+            try:
+                f = float(s)
+            except ValueError:
+                pct = DEFAULT_VOLUME_STEP_PCT
+            else:
+                pct = round(f * 100) if f <= 0.5 else round(f)
+        else:
+            try:
+                f = float(raw)
+            except (TypeError, ValueError):
+                pct = DEFAULT_VOLUME_STEP_PCT
+            else:
+                pct = round(f * 100) if f <= 0.5 else round(f)
+
+        pct = int(max(MIN_VOLUME_STEP_PCT, min(MAX_VOLUME_STEP_PCT, pct)))
+        return pct / 100.0
+
+    async def async_volume_up(self) -> None:
+        """Increase volume by a configured step (default 2%)."""
+        current = self.volume_level if self.volume_level is not None else 0.0
+        step = self._get_volume_step()
+        target = round(min(1.0, current + step), 2)
+        await self.async_set_volume_level(target)
+
+    async def async_volume_down(self) -> None:
+        """Decrease volume by a configured step (default 2%)."""
+        current = self.volume_level if self.volume_level is not None else 0.0
+        step = self._get_volume_step()
+        target = round(max(0.0, current - step), 2)
+        await self.async_set_volume_level(target)
+
     @property
     def is_volume_muted(self) -> bool | None:
         """Boolean if volume is currently muted."""
@@ -1520,6 +1569,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
             | MediaPlayerEntityFeature.PREVIOUS_TRACK
             | MediaPlayerEntityFeature.VOLUME_MUTE
             | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.VOLUME_STEP
             | MediaPlayerEntityFeature.SELECT_SOURCE
             | MediaPlayerEntityFeature.TURN_OFF
         )

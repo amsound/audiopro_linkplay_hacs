@@ -1,17 +1,25 @@
 {
   "domain": "audiopro_linkplay",
   "name": "Audio Pro (LinkPlay)",
-  "version": "1.0",
+  "after_dependencies": [
+    "media_source"
+  ],
   "config_flow": true,
-  "integration_type": "device",
-  "iot_class": "local_push",
+  "dependencies": [
+    "ssdp"
+  ],
+  "codeowners": [
+    "@amsound"
+  ],
   "documentation": "https://github.com/amsound/audiopro_linkplay_hacs",
   "issue_tracker": "https://github.com/amsound/audiopro_linkplay_hacs/issues",
-  "codeowners": ["@amsound"],
-  "dependencies": ["ssdp"],
-  "after_dependencies": ["media_source"],
-  "loggers": ["async_upnp_client"],
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "loggers": [
+    "async_upnp_client"
+  ],
   "requirements": [],
+  "version": "1.0.1",
   "ssdp": [
     {
       "deviceType": "urn:schemas-upnp-org:device:MediaRenderer:1",

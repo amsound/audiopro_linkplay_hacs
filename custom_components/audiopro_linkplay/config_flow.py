@@ -27,6 +27,11 @@ from homeassistant.const import CONF_DEVICE_ID, CONF_HOST, CONF_MAC, CONF_TYPE, 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import IntegrationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 from homeassistant.helpers.service_info.ssdp import (
     ATTR_UPNP_DEVICE_TYPE,
     ATTR_UPNP_FRIENDLY_NAME,
@@ -42,6 +47,10 @@ from .const import (
     CONF_CALLBACK_URL_OVERRIDE,
     CONF_LISTEN_PORT,
     CONF_POLL_AVAILABILITY,
+    CONF_VOLUME_STEP_PCT,
+    DEFAULT_VOLUME_STEP_PCT,
+    MAX_VOLUME_STEP_PCT,
+    MIN_VOLUME_STEP_PCT,
     DEFAULT_NAME,
     DOMAIN,
 )
@@ -330,7 +339,7 @@ class AudioProLinkPlayFlowHandler(ConfigFlow, domain=DOMAIN):
 
 
 class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
-    """Handle a DLNA DMR options flow.
+    """Handle an Audio Pro (LinkPlay) options flow.
 
     Configures the single instance and updates the existing config entry.
     """
@@ -340,13 +349,52 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage the options."""
         errors: dict[str, str] = {}
+
         # Don't modify existing (read-only) options -- copy and update instead
         options = dict(self.config_entry.options)
 
+        def _normalize_volume_step_pct(value: Any) -> int:
+            """Normalize volume step to an integer percent (1..5).
+
+            We store the option as an integer percent so the UI can display
+            "2%" like the vendor app. Be forgiving if users/editors store a
+            float (0.02) or a string ("2%", "0.02").
+            """
+            if value is None:
+                pct = DEFAULT_VOLUME_STEP_PCT
+            elif isinstance(value, str):
+                s = value.strip()
+                if s.endswith("%"):
+                    s = s[:-1].strip()
+                try:
+                    f = float(s)
+                except ValueError:
+                    pct = DEFAULT_VOLUME_STEP_PCT
+                else:
+                    pct = round(f * 100) if f <= 0.5 else round(f)
+            else:
+                try:
+                    f = float(value)
+                except (TypeError, ValueError):
+                    pct = DEFAULT_VOLUME_STEP_PCT
+                else:
+                    pct = round(f * 100) if f <= 0.5 else round(f)
+
+            return int(max(MIN_VOLUME_STEP_PCT, min(MAX_VOLUME_STEP_PCT, pct)))
+
+        # Suggested/default value for the options UI.
+        volume_step_pct = _normalize_volume_step_pct(
+            options.get(CONF_VOLUME_STEP_PCT, DEFAULT_VOLUME_STEP_PCT)
+        )
+
         if user_input is not None:
             LOGGER.debug("user_input: %s", user_input)
+
             listen_port = user_input.get(CONF_LISTEN_PORT) or None
             callback_url_override = user_input.get(CONF_CALLBACK_URL_OVERRIDE) or None
+            volume_step_pct = _normalize_volume_step_pct(
+                user_input.get(CONF_VOLUME_STEP_PCT, volume_step_pct)
+            )
 
             try:
                 # Cannot use cv.url validation in the schema itself so apply
@@ -360,6 +408,7 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
             options[CONF_CALLBACK_URL_OVERRIDE] = callback_url_override
             options[CONF_POLL_AVAILABILITY] = user_input[CONF_POLL_AVAILABILITY]
             options[CONF_BROWSE_UNFILTERED] = user_input[CONF_BROWSE_UNFILTERED]
+            options[CONF_VOLUME_STEP_PCT] = volume_step_pct
 
             # Save if there's no errors, else fall through and show the form again
             if not errors:
@@ -368,7 +417,7 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
         fields: VolDictType = {}
 
         def _add_with_suggestion(key: str, validator: Callable | type[bool]) -> None:
-            """Add a field to with a suggested value.
+            """Add a field with a suggested value.
 
             For bools, use the existing value as default, or fallback to False.
             """
@@ -387,13 +436,24 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
         _add_with_suggestion(CONF_POLL_AVAILABILITY, bool)
         _add_with_suggestion(CONF_BROWSE_UNFILTERED, bool)
 
+        # Volume step as percent (1..5), shown as a slider.
+        fields[vol.Required(CONF_VOLUME_STEP_PCT, default=volume_step_pct)] = (
+            NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_VOLUME_STEP_PCT,
+                    max=MAX_VOLUME_STEP_PCT,
+                    step=1,
+                    unit_of_measurement="%",
+                    mode=NumberSelectorMode.SLIDER,
+                )
+            )
+        )
+
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(fields),
             errors=errors,
         )
-
-
 def _is_ignored_device(discovery_info: SsdpServiceInfo) -> bool:
     """Return True if this device should be ignored for discovery.
 
