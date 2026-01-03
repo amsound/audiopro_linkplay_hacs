@@ -44,4 +44,13 @@ Please open an issue in this repo with:
 - speaker model + firmware (if available)
 - Home Assistant version
 - a short description of expected vs actual behaviour
-- logs (debug logs are helpful if relevant)
+- logs (debug logs are helpful if relevant), set this in configuration.yaml:
+
+  ```
+  logger:
+  default: info
+  logs:
+    custom_components.audiopro_linkplay: debug
+    async_upnp_client: debug
+    aiohttp.web: info
+  ```
