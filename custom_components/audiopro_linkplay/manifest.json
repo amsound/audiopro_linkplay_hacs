@@ -20,7 +20,6 @@
     "async_upnp_client"
   ],
   "requirements": [],
-  "version": "1.0.1",
   "ssdp": [
     {
       "deviceType": "urn:schemas-upnp-org:device:MediaRenderer:1",
