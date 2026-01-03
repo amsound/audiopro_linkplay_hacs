@@ -1,56 +1,60 @@
 {
   "config": {
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-      "alternative_integration": "Device is better supported by another integration",
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "incomplete_config": "Configuration is missing a required variable",
-      "non_unique_id": "Multiple devices found with the same unique ID",
-      "not_dmr": "Device is not a supported Digital Media Renderer"
-    },
-    "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "not_dmr": "[%key:component::audiopro_linkplay::config::abort::not_dmr%]"
-    },
     "flow_title": "{name}",
     "step": {
-      "confirm": {
-        "description": "[%key:common::config_flow::description::confirm_setup%]"
-      },
-      "import_turn_on": {
-        "description": "Please turn on the device and select **Submit** to continue migration"
+      "user": {
+        "title": "Discovered Audio Pro (LinkPlay) devices",
+        "description": "Choose a device to configure or leave blank to enter a URL",
+        "data": {
+          "host": "Host"
+        }
       },
       "manual": {
-        "data": {
-          "url": "[%key:common::config_flow::data::url%]"
-        },
+        "title": "Manual Audio Pro (LinkPlay) device connection",
         "description": "URL to a device description XML file",
-        "title": "Manual Audio Pro (LinkPlay) device connection"
-      },
-      "user": {
         "data": {
-          "host": "[%key:common::config_flow::data::host%]"
-        },
-        "description": "Choose a device to configure or leave blank to enter a URL",
-        "title": "Discovered Audio Pro (LinkPlay) devices"
+          "url": "URL"
+        }
+      },
+      "confirm": {
+        "title": "Confirm setup",
+        "description": "Do you want to set up {name}?"
+      },
+      "import_turn_on": {
+        "title": "Turn on device",
+        "description": "Please turn on the device and select **Submit** to continue migration"
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "not_dmr": "Device is not a supported Digital Media Renderer",
+      "incomplete_config": "Configuration is missing a required value",
+      "non_unique_id": "Multiple devices found with the same unique ID"
+    },
+    "abort": {
+      "already_configured": "This device is already configured",
+      "cannot_connect": "Failed to connect",
+      "not_dmr": "Device is not a supported Digital Media Renderer",
+      "incomplete_config": "Configuration is missing a required value",
+      "non_unique_id": "Multiple devices found with the same unique ID",
+      "alternative_integration": "Device is better supported by another integration"
     }
   },
   "options": {
-    "error": {
-      "invalid_url": "Invalid URL"
-    },
     "step": {
       "init": {
+        "title": "Audio Pro (LinkPlay) configuration",
         "data": {
-          "browse_unfiltered": "Show incompatible media when browsing",
+          "volume_step_pct": "Volume step (%)",
           "callback_url_override": "Event listener callback URL",
           "listen_port": "Event listener port (random if not set)",
           "poll_availability": "Poll for device availability",
-          "volume_step_pct": "Volume step (%)"
-        },
-        "title": "Audio Pro (LinkPlay) configuration"
+          "browse_unfiltered": "Show incompatible media when browsing"
+        }
       }
+    },
+    "error": {
+      "invalid_url": "Invalid URL"
     }
   }
 }
