@@ -302,6 +302,11 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # secondary guard to allow auto-Play even if source inference lags.
         self._last_optical_signal_monotonic: float = 0.0
         self._last_optical_signal_status: str | None = None
+        # Raw service on_event taps (pre-DLNA LastChange expansion). Used to
+        # observe vendor commonevent payloads that async_upnp_client may not
+        # expose as state variables after parsing.
+        self._tapped_services: dict[UpnpService, Any] = {}
+
 
         self._background_setup_task: asyncio.Task[None] | None = None
         self._updated_registry: bool = False
@@ -713,6 +718,73 @@ class DlnaDmrEntity(MediaPlayerEntity):
         """Write the state."""
         super().async_write_ha_state()
 
+
+    def _install_raw_notify_taps(self, upnp_device: Any) -> None:
+        """Install raw NOTIFY taps on services before DLNA LastChange expansion.
+
+        async_upnp_client's DLNA profile parses RenderingControl/AVTransport
+        LastChange and may drop vendor-specific fields like `commonevent`.
+        We wrap the underlying service.on_event callback to observe the raw
+        state variables and extract optical signal changes reliably.
+        """
+        try:
+            services_obj = getattr(upnp_device, "services", None)
+            if isinstance(services_obj, dict):
+                services = list(services_obj.values())
+            elif services_obj is None:
+                services = []
+            else:
+                services = list(services_obj)
+        except Exception:  # noqa: BLE001
+            services = []
+
+        for svc in services:
+            st = (getattr(svc, "service_type", "") or "")
+            sid = (getattr(svc, "service_id", "") or "")
+            if "RenderingControl" not in st and "RenderingControl" not in sid:
+                continue
+            if svc in self._tapped_services:
+                continue
+
+            orig = getattr(svc, "on_event", None)
+            self._tapped_services[svc] = orig
+
+            def _wrapped(service: UpnpService, state_vars: Sequence[UpnpStateVariable], *, _orig=orig) -> None:
+                try:
+                    for sv in state_vars:
+                        if not isinstance(sv.value, str):
+                            continue
+                        name = (sv.name or "")
+                        # Look for vendor signal notifications either embedded in
+                        # LastChange or provided directly as commonevent.
+                        if name in ("LastChange", "commonevent"):
+                            raw = sv.value
+                            # Cheap check before doing heavier parsing.
+                            if "audio_input_signal_changed" in raw or "audio_input_signal_changed" in html.unescape(raw):
+                                _LOGGER.debug(
+                                    "Raw RenderingControl %s observed (contains audio_input_signal_changed)",
+                                    name,
+                                )
+                                self._maybe_kick_optical_from_lastchange(raw)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Error in raw RenderingControl event tap: %s", err)
+
+                if callable(_orig):
+                    try:
+                        _orig(service, state_vars)
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("Error in original RenderingControl on_event: %s", err)
+
+            try:
+                svc.on_event = _wrapped
+                _LOGGER.debug(
+                    "Installed raw NOTIFY tap on RenderingControl: service_id=%s service_type=%s",
+                    sid,
+                    st,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Failed to install raw NOTIFY tap on RenderingControl: %s", err)
+
     async def _device_connect(self, location: str) -> None:
         """Connect to the device now that it's available."""
         _LOGGER.debug("Connecting to device at %s", location)
@@ -739,6 +811,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
             # Create profile wrapper
             self._device = DmrDevice(upnp_device, event_handler)
+
+            # Tap raw service events to capture vendor commonevent payloads.
+            self._install_raw_notify_taps(upnp_device)
 
             self.location = location
 
@@ -830,6 +905,15 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 return
 
             _LOGGER.debug("Disconnecting from %s", self._device.name)
+
+            # Restore any tapped service callbacks (best-effort).
+            for svc, orig in list(self._tapped_services.items()):
+                try:
+                    svc.on_event = orig
+                except Exception:  # noqa: BLE001
+                    pass
+            self._tapped_services.clear()
+
 
             # Event-driven state; nothing to stop here beyond UPnP subscriptions.
 
