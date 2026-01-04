@@ -1154,34 +1154,47 @@ class DlnaDmrEntity(MediaPlayerEntity):
         )
 
     def _maybe_kick_optical_from_lastchange(self, raw_lastchange: str) -> None:
-        """Detect optical-signal events in LastChange and kick Play if needed."""
+        """Detect optical-signal events in LastChange and kick Play if needed.
+
+        Audio Pro/LinkPlay firmwares sometimes require an explicit AVTransport Play
+        after the optical signal state machine reaches certain states (notably
+        `nosound` and occasionally `playing`). Triggering Play too early (e.g.
+        while `detecting`) can be undone by the firmware once it transitions to
+        `nosound`.
+        """
         if not self._optical_autoplay_enabled():
             return
 
         raw = raw_lastchange.lower()
 
-        # Vendor common event payloads observed on LinkPlay devices often embed
-        # a category like `audio_input_signal_changed` plus a modeName.
+        # Vendor common event payloads observed on LinkPlay devices embed a
+        # category like `audio_input_signal_changed` plus modeName/contentStatus.
         if "audio_input_signal_changed" not in raw:
             return
 
-        # Try to extract a mode name; fall back to substring checks.
-        mode = None
-        m = re.search(r"modename\s*[:=]\s*([a-z0-9_-]+)", raw)
-        if m:
-            mode = m.group(1).strip()
+        # Ensure this event pertains to Optical (or SPDIF).
+        if "optical" not in raw and "spdif" not in raw:
+            # Fall back to parsing the modeName if present.
+            m_mode = re.search(r"modename\s*[:=]\s*([a-z0-9_-]+)", raw)
+            if m_mode:
+                mode = m_mode.group(1).strip()
+                if "opt" not in mode and "spdif" not in mode:
+                    return
+            else:
+                return
 
-        # Only apply to optical. Different firmwares may call this `optical`,
-        # `spdif`, or `...opt...`.
-        if mode:
-            if "opt" not in mode and "spdif" not in mode:
-                return
-        else:
-            if "optical" not in raw and "spdif" not in raw:
-                return
+        # Extract contentStatus (best-effort). Only trigger on end-of-detection
+        # states where Play is least likely to be undone by the firmware.
+        m_status = re.search(r"contentstatus\s*[:=]\s*([a-z0-9_-]+)", raw)
+        status = m_status.group(1).strip() if m_status else None
+
+        if status not in ("nosound", "playing"):
+            return
 
         # Kick play (rate limited). Do not block the event handler.
-        self._schedule_optical_autoplay_kick(delay=0.0, reason="signal_changed")
+        # Delay slightly to avoid racing device state transitions.
+        self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
+
 
     def _start_position_polling(self) -> None:
         """Poll position every 5s while playing (fallback for devices with flaky eventing)."""
@@ -1312,10 +1325,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_media_image = None
         self.async_write_ha_state()
 
-        # Optical input firmware workaround: some devices require a "Play" kick
-        # after switching to Optical for audio to pass.
-        if source == "Optical":
-            self._schedule_optical_autoplay_kick(delay=0.3, reason="switch")
+        # Optical input firmware workaround:
+        # Some firmwares pause/stop the optical path unless they receive a Play
+        # AFTER the device has finished detecting the signal. We therefore do not
+        # send Play immediately on switch; instead we react to RenderingControl
+        # commonevent updates (audio_input_signal_changed) for Optical statuses
+        # like `nosound` or `playing`.
 
     @property
     def volume_level(self) -> float | None:
