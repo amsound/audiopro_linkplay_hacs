@@ -1165,7 +1165,17 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not self._optical_autoplay_enabled():
             return
 
-        raw = raw_lastchange.lower()
+        # raw_lastchange is often HTML-escaped (sometimes multiple times)
+        # inside the UPnP LastChange value. Unescape iteratively so we can
+        # reliably match vendor commonevent payloads.
+        _raw = raw_lastchange
+        for _ in range(3):
+            _un = html.unescape(_raw)
+            if _un == _raw:
+                break
+            _raw = _un
+
+        raw = _raw.lower()
 
         # Vendor common event payloads observed on LinkPlay devices embed a
         # category like `audio_input_signal_changed` plus modeName/contentStatus.
@@ -1183,15 +1193,24 @@ class DlnaDmrEntity(MediaPlayerEntity):
             else:
                 return
 
-        # Extract contentStatus (best-effort). Only trigger on end-of-detection
+                # Extract contentStatus (best-effort). Only trigger on end-of-detection
         # states where Play is least likely to be undone by the firmware.
-        m_status = re.search(r"contentstatus\s*[:=]\s*([a-z0-9_-]+)", raw)
-        status = m_status.group(1).strip() if m_status else None
+        status: str | None = None
+        for pat in (
+            r'"contentstatus"\s*:\s*"([^"]+)"',
+            r'contentstatus"\s*:\s*&quot;([^&"]+)',
+            r'contentstatus\s*[:=]\s*&quot;([a-z0-9_-]+)&quot;',
+            r'contentstatus\s*[:=]\s*"?([a-z0-9_-]+)"?',
+        ):
+            m_status = re.search(pat, raw)
+            if m_status:
+                status = (m_status.group(1) or "").strip().strip('"')
+                break
 
         if status not in ("nosound", "playing"):
             return
 
-        # Kick play (rate limited). Do not block the event handler.
+# Kick play (rate limited). Do not block the event handler.
         # Delay slightly to avoid racing device state transitions.
         self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
 
