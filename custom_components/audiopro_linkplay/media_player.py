@@ -7,6 +7,8 @@ import json
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 import contextlib
 import html
+import time
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse
@@ -48,12 +50,15 @@ from .const import (
     CONF_BROWSE_UNFILTERED,
     CONF_CALLBACK_URL_OVERRIDE,
     CONF_LISTEN_PORT,
+    CONF_OPTICAL_AUTOPLAY,
     CONF_POLL_AVAILABILITY,
     CONF_VOLUME_STEP_PCT,
     DOMAIN,
+    DEFAULT_OPTICAL_AUTOPLAY,
     DEFAULT_VOLUME_STEP_PCT,
     MAX_VOLUME_STEP_PCT,
     MIN_VOLUME_STEP_PCT,
+    OPTICAL_AUTOPLAY_COOLDOWN_SECONDS,
     LOGGER as _LOGGER,
     MEDIA_METADATA_DIDL,
     MEDIA_TYPE_MAP,
@@ -287,6 +292,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_media_image: tuple[str, bytes, str] | None = None
         self._cached_fallback_image: tuple[str, bytes] | None = None
         self._cached_icon_image: bytes | None = None
+
+        # Optical input firmware workaround: some devices require a Play after
+        # switching (or when optical signal returns) to actually open the audio
+        # path.
+        self._last_optical_autoplay_monotonic: float = 0.0
+        self._pending_optical_autoplay_task: asyncio.Task[None] | None = None
 
         self._background_setup_task: asyncio.Task[None] | None = None
         self._updated_registry: bool = False
@@ -887,8 +898,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
                 ):
+                    unescaped = html.unescape(state_variable.value)
+                    # Some firmwares embed vendor common events (including
+                    # optical signal changes) inside LastChange.
+                    self._maybe_kick_optical_from_lastchange(unescaped)
                     try:
-                        root = ET.fromstring(html.unescape(state_variable.value))
+                        root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
                         continue
 
@@ -981,8 +996,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
                 ):
+                    unescaped = html.unescape(state_variable.value)
+                    # Some firmwares include vendor common events (including
+                    # optical signal changes) inside RenderingControl LastChange.
+                    self._maybe_kick_optical_from_lastchange(unescaped)
                     try:
-                        root = ET.fromstring(html.unescape(state_variable.value))
+                        root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
                         continue
 
@@ -1073,6 +1092,96 @@ class DlnaDmrEntity(MediaPlayerEntity):
                     await resp.read()
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("LinkPlay HTTP API call failed (%s): %s", url, err)
+
+    def _optical_autoplay_enabled(self) -> bool:
+        """Return True if optical autoplay workaround is enabled."""
+        return bool(
+            self._config_entry.options.get(CONF_OPTICAL_AUTOPLAY, DEFAULT_OPTICAL_AUTOPLAY)
+        )
+
+    def _schedule_optical_autoplay_kick(self, *, delay: float, reason: str) -> None:
+        """Schedule a best-effort Play kick for optical input."""
+        if not self._optical_autoplay_enabled():
+            return
+
+        # Cancel any pending kick and schedule a new one.
+        if self._pending_optical_autoplay_task is not None:
+            self._pending_optical_autoplay_task.cancel()
+            self._pending_optical_autoplay_task = None
+
+        async def _runner() -> None:
+            try:
+                if delay:
+                    await asyncio.sleep(delay)
+                await self._async_optical_autoplay_kick(reason=reason)
+            except asyncio.CancelledError:
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Optical autoplay kick failed: %s", err)
+
+        self._pending_optical_autoplay_task = self.hass.async_create_task(_runner())
+
+    async def _async_optical_autoplay_kick(self, *, reason: str) -> None:
+        """Send a UPnP Play to open the optical audio path.
+
+        Some firmwares require a Play after switching to Optical or after the
+        optical signal becomes present again.
+        """
+        if not self._device:
+            return
+
+        # Only for optical source.
+        if self.source != "Optical":
+            return
+
+        # Don't disturb active playback.
+        if self.state == MediaPlayerState.PLAYING:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_optical_autoplay_monotonic) < OPTICAL_AUTOPLAY_COOLDOWN_SECONDS:
+            return
+        self._last_optical_autoplay_monotonic = now
+
+        _LOGGER.debug("Optical autoplay: sending Play (reason=%s)", reason)
+
+        # Use AVTransport#Play (UPnP), mirroring the vendor apps.
+        await self._async_call_action(
+            "urn:schemas-upnp-org:service:AVTransport:1",
+            "Play",
+            InstanceID=0,
+            Speed="1",
+        )
+
+    def _maybe_kick_optical_from_lastchange(self, raw_lastchange: str) -> None:
+        """Detect optical-signal events in LastChange and kick Play if needed."""
+        if not self._optical_autoplay_enabled():
+            return
+
+        raw = raw_lastchange.lower()
+
+        # Vendor common event payloads observed on LinkPlay devices often embed
+        # a category like `audio_input_signal_changed` plus a modeName.
+        if "audio_input_signal_changed" not in raw:
+            return
+
+        # Try to extract a mode name; fall back to substring checks.
+        mode = None
+        m = re.search(r"modename\s*[:=]\s*([a-z0-9_-]+)", raw)
+        if m:
+            mode = m.group(1).strip()
+
+        # Only apply to optical. Different firmwares may call this `optical`,
+        # `spdif`, or `...opt...`.
+        if mode:
+            if "opt" not in mode and "spdif" not in mode:
+                return
+        else:
+            if "optical" not in raw and "spdif" not in raw:
+                return
+
+        # Kick play (rate limited). Do not block the event handler.
+        self._schedule_optical_autoplay_kick(delay=0.0, reason="signal_changed")
 
     def _start_position_polling(self) -> None:
         """Poll position every 5s while playing (fallback for devices with flaky eventing)."""
@@ -1202,6 +1311,11 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_fallback_image = None
         self._cached_media_image = None
         self.async_write_ha_state()
+
+        # Optical input firmware workaround: some devices require a "Play" kick
+        # after switching to Optical for audio to pass.
+        if source == "Optical":
+            self._schedule_optical_autoplay_kick(delay=0.3, reason="switch")
 
     @property
     def volume_level(self) -> float | None:
