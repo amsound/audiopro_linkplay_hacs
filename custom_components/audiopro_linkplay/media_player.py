@@ -298,6 +298,10 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # path.
         self._last_optical_autoplay_monotonic: float = 0.0
         self._pending_optical_autoplay_task: asyncio.Task[None] | None = None
+        # Last time we observed an optical signal-change event. Used as a
+        # secondary guard to allow auto-Play even if source inference lags.
+        self._last_optical_signal_monotonic: float = 0.0
+        self._last_optical_signal_status: str | None = None
 
         self._background_setup_task: asyncio.Task[None] | None = None
         self._updated_registry: bool = False
@@ -874,8 +878,13 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         force_refresh = False
 
+        svc_id = (getattr(service, "service_id", "") or "")
+        svc_type = (getattr(service, "service_type", "") or "")
+        # Some LinkPlay firmwares use non-standard service_id values; match by substring too.
+
+
         # LinkPlay/WiiM state is primarily ...
-        if service.service_id == "urn:upnp-org:serviceId:AVTransport":
+        if "AVTransport" in svc_type or "AVTransport" in svc_id:
             for state_variable in state_variables:
                 # Force a state refresh when player begins or pauses playback
                 # to update the position info.
@@ -960,7 +969,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                             continue
                         self._update_cached_loop_mode(el.attrib.get("val") or el.text)
 
-        elif service.service_id == "urn:upnp-org:serviceId:RenderingControl":
+        elif "RenderingControl" in svc_type or "RenderingControl" in svc_id:
             def _coerce_volume(val: Any) -> float | None:
                 """Convert a device-reported volume to 0..1."""
                 try:
@@ -992,6 +1001,14 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 if state_variable.name == "Volume":
                     if (v := _coerce_volume(state_variable.value)) is not None:
                         self._cached_volume_level = v
+
+                # Some firmwares (and async_upnp_client) expand the RenderingControl
+                # LastChange and provide vendor common events directly as a
+                # `commonevent` state variable. Handle this path as well.
+                if state_variable.name == "commonevent" and isinstance(
+                    state_variable.value, str
+                ):
+                    self._maybe_kick_optical_from_lastchange(state_variable.value)
 
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
@@ -1130,9 +1147,14 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not self._device:
             return
 
-        # Only for optical source.
+        # Prefer to only kick while on Optical, but be resilient to cases where
+        # source inference lags. If we very recently observed an optical
+        # signal-change event, allow the kick even if the current source isn't
+        # yet "Optical".
         if self.source != "Optical":
-            return
+            now_m = time.monotonic()
+            if (now_m - self._last_optical_signal_monotonic) > 30.0:
+                return
 
         # Don't disturb active playback.
         if self.state == MediaPlayerState.PLAYING:
@@ -1143,7 +1165,13 @@ class DlnaDmrEntity(MediaPlayerEntity):
             return
         self._last_optical_autoplay_monotonic = now
 
-        _LOGGER.debug("Optical autoplay: sending Play (reason=%s)", reason)
+        _LOGGER.debug(
+            "Optical autoplay: sending Play (reason=%s, source=%s, state=%s, last_signal=%s)",
+            reason,
+            self.source,
+            self.state,
+            self._last_optical_signal_status,
+        )
 
         # Use AVTransport#Play (UPnP), mirroring the vendor apps.
         await self._async_call_action(
@@ -1166,53 +1194,92 @@ class DlnaDmrEntity(MediaPlayerEntity):
             return
 
         # raw_lastchange is often HTML-escaped (sometimes multiple times)
-        # inside the UPnP LastChange value. Unescape iteratively so we can
-        # reliably match vendor commonevent payloads.
+        # inside the UPnP LastChange value. Unescape iteratively.
         _raw = raw_lastchange
-        for _ in range(3):
+        for _ in range(5):
             _un = html.unescape(_raw)
             if _un == _raw:
                 break
             _raw = _un
 
-        raw = _raw.lower()
-
-        # Vendor common event payloads observed on LinkPlay devices embed a
-        # category like `audio_input_signal_changed` plus modeName/contentStatus.
-        if "audio_input_signal_changed" not in raw:
-            return
-
-        # Ensure this event pertains to Optical (or SPDIF).
-        if "optical" not in raw and "spdif" not in raw:
-            # Fall back to parsing the modeName if present.
-            m_mode = re.search(r"modename\s*[:=]\s*([a-z0-9_-]+)", raw)
-            if m_mode:
-                mode = m_mode.group(1).strip()
-                if "opt" not in mode and "spdif" not in mode:
-                    return
+        # Prefer parsing the JSON-ish commonevent payload (more robust than
+        # matching the raw XML/text).
+        payload: dict[str, Any] | None = None
+        try:
+            # Extract the commonevent attribute value if present.
+            m = re.search(r"commonevent[^>]*\sval=\"([^\"]+)\"", _raw)
+            if m:
+                ce = html.unescape(m.group(1))
+                payload = json.loads(ce)
             else:
+                # Sometimes async_upnp_client provides commonevent directly
+                # in expanded form inside the raw string; attempt to locate
+                # the first JSON object.
+                start = _raw.find("{")
+                end = _raw.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    payload = json.loads(_raw[start : end + 1])
+        except Exception:  # noqa: BLE001
+            payload = None
+
+        category = None
+        changed = None
+        if isinstance(payload, dict):
+            category = str(payload.get("category") or "").lower()
+            body = payload.get("body") or {}
+            if isinstance(body, dict):
+                changed = body.get("changed")
+
+        if category != "audio_input_signal_changed" or not isinstance(changed, dict):
+            # Fallback: regex match on the raw payload.
+            raw = _raw.lower()
+            if "audio_input_signal_changed" not in raw:
                 return
+            m_mode = re.search(r"\"modename\"\s*:\s*\"([^\"]+)\"", raw)
+            mode = (m_mode.group(1) if m_mode else "").strip().lower()
+            m_status = re.search(r"\"contentstatus\"\s*:\s*\"([^\"]+)\"", raw)
+            status = (m_status.group(1) if m_status else "").strip().lower()
+            m_en = re.search(r"\"contentenable\"\s*:\s*(\d+)", raw)
+            enabled = int(m_en.group(1)) if m_en else None
+        else:
+            mode = str(changed.get("modeName") or "").strip().lower()
+            status = str(changed.get("contentStatus") or "").strip().lower()
+            enabled = changed.get("contentEnable")
+            try:
+                enabled = int(enabled) if enabled is not None else None
+            except Exception:  # noqa: BLE001
+                enabled = None
 
-                # Extract contentStatus (best-effort). Only trigger on end-of-detection
-        # states where Play is least likely to be undone by the firmware.
-        status: str | None = None
-        for pat in (
-            r'"contentstatus"\s*:\s*"([^"]+)"',
-            r'contentstatus"\s*:\s*&quot;([^&"]+)',
-            r'contentstatus\s*[:=]\s*&quot;([a-z0-9_-]+)&quot;',
-            r'contentstatus\s*[:=]\s*"?([a-z0-9_-]+)"?',
-        ):
-            m_status = re.search(pat, raw)
-            if m_status:
-                status = (m_status.group(1) or "").strip().strip('"')
-                break
-
-        if status not in ("nosound", "playing"):
+        if not mode:
             return
 
-# Kick play (rate limited). Do not block the event handler.
-        # Delay slightly to avoid racing device state transitions.
-        self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
+        # Update our idea of the current source from the signal-change event.
+        # This helps when AVTransportURI lags or isn't emitted for inputs.
+        if enabled == 1:
+            if mode in ("optical", "spdif"):
+                self._linkplay_source_name = "Optical"
+            elif mode in ("line-in", "linein", "aux"):
+                self._linkplay_source_name = "Line-In"
+            elif mode.startswith("hdmi") or mode == "arc":
+                self._linkplay_source_name = "HDMI ARC"
+
+        # Track recent optical signal events to allow kicking Play even if
+        # source inference lags.
+        if mode in ("optical", "spdif") and enabled == 1:
+            self._last_optical_signal_monotonic = time.monotonic()
+            self._last_optical_signal_status = status
+
+        # Only kick on end-of-detection states where Play is least likely to be
+        # undone by the firmware.
+        if mode in ("optical", "spdif") and enabled == 1 and status in ("nosound", "playing"):
+            _LOGGER.debug(
+                "Optical signal event: status=%s enabled=%s state=%s source=%s -> schedule Play",
+                status,
+                enabled,
+                self.state,
+                self.source,
+            )
+            self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
 
 
     def _start_position_polling(self) -> None:
