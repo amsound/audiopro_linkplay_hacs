@@ -491,6 +491,8 @@ def _is_ignored_device(discovery_info: SsdpServiceInfo) -> bool:
     # that advertise multiple unrelated (sent in separate discovery packets)
     # UPnP devices.
     manufacturer = (discovery_info.upnp.get(ATTR_UPNP_MANUFACTURER) or "").lower()
+    if manufacturer and manufacturer != "audio pro ab":
+        return True
     model = (discovery_info.upnp.get(ATTR_UPNP_MODEL_NAME) or "").lower()
 
     if manufacturer.startswith("xbmc") or model == "kodi":
