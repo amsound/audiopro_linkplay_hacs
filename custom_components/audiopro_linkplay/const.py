@@ -14,6 +14,7 @@ LOGGER = logging.getLogger(__package__)
 
 DOMAIN: Final = "audiopro_linkplay"
 
+CONF_LISTEN_HOST: Final = "listen_host"
 CONF_LISTEN_PORT: Final = "listen_port"
 CONF_CALLBACK_URL_OVERRIDE: Final = "callback_url_override"
 CONF_POLL_AVAILABILITY: Final = "poll_availability"

@@ -49,6 +49,7 @@ from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 from .const import (
     CONF_BROWSE_UNFILTERED,
     CONF_CALLBACK_URL_OVERRIDE,
+    CONF_LISTEN_HOST,
     CONF_LISTEN_PORT,
     CONF_OPTICAL_AUTOPLAY,
     CONF_POLL_AVAILABILITY,
@@ -189,6 +190,7 @@ async def async_setup_entry(
         udn=udn,
         device_type=entry.data[CONF_TYPE],
         name=entry.title,
+        event_host=entry.options.get(CONF_LISTEN_HOST),
         event_port=entry.options.get(CONF_LISTEN_PORT) or 0,
         event_callback_url=entry.options.get(CONF_CALLBACK_URL_OVERRIDE),
         poll_availability=entry.options.get(CONF_POLL_AVAILABILITY, False),
@@ -236,6 +238,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         udn: str,
         device_type: str,
         name: str,
+        event_host: str | None,
         event_port: int,
         event_callback_url: str | None,
         poll_availability: bool,
@@ -248,7 +251,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self.udn = udn
         self.device_type = device_type
         self._attr_name = name
-        self._event_addr = EventListenAddr(None, event_port, event_callback_url)
+        self._event_addr = EventListenAddr(event_host, event_port, event_callback_url)
         self.poll_availability = poll_availability
         self.location = location
         self.mac_address = mac_address
@@ -314,6 +317,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._attr_device_info = dr.DeviceInfo(connections={(dr.CONNECTION_UPNP, udn)})
         # We don't expose/bother with browsing for LinkPlay-based renderers
         self._can_browse_media = False
+        self._resubscribe_reconnect = False
     def _find_service(self, service_type: str):
         """Best-effort lookup of a UPnP service.
 
@@ -691,11 +695,13 @@ class DlnaDmrEntity(MediaPlayerEntity):
             self.mac_address = new_mac_address
             self._update_device_registry(set_mac=True)
 
+        new_host = entry.options.get(CONF_LISTEN_HOST)
         new_port = entry.options.get(CONF_LISTEN_PORT) or 0
         new_callback_url = entry.options.get(CONF_CALLBACK_URL_OVERRIDE)
 
         if (
-            new_port == self._event_addr.port
+            new_host == self._event_addr.host
+            and new_port == self._event_addr.port
             and new_callback_url == self._event_addr.callback_url
         ):
             return
@@ -704,7 +710,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         await self._device_disconnect()
         # Update _event_addr after disconnecting, to stop the right event listener
         self._event_addr = self._event_addr._replace(
-            port=new_port, callback_url=new_callback_url
+            host=new_host, port=new_port, callback_url=new_callback_url
         )
         try:
             await self._device_connect(self.location)
@@ -801,8 +807,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
             # Create/get event handler that is reachable by the device, using
             # the connection's local IP to listen only on the relevant interface
-            _, event_ip = await async_get_local_ip(location, self.hass.loop)
-            self._event_addr = self._event_addr._replace(host=event_ip)
+            if not self._event_addr.host:
+                _, event_ip = await async_get_local_ip(location, self.hass.loop)
+                self._event_addr = self._event_addr._replace(host=event_ip)
             event_handler = await domain_data.async_get_event_notifier(
                 self._event_addr, self.hass
             )
@@ -941,6 +948,14 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         assert self._device is not None
 
+        if self._resubscribe_reconnect:
+            self._resubscribe_reconnect = False
+            try:
+                await self._device_disconnect()
+                await self._device_connect(self.location)
+            except UpnpError:
+                return
+
         try:
             do_ping = self.poll_availability or self.check_available
             await self._device.async_update(do_ping=do_ping)
@@ -959,6 +974,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not state_variables:
             # Indicates a failure to resubscribe, check if device is still available
             self.check_available = True
+            self._resubscribe_reconnect = True
 
         force_refresh = False
 
