@@ -991,10 +991,10 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
                 ):
-                    unescaped = html.unescape(state_variable.value)
-                    # Some firmwares embed vendor common events (including
-                    # optical signal changes) inside LastChange.
-                    self._maybe_kick_optical_from_lastchange(unescaped)
+                    raw_lastchange = state_variable.value or ""
+                    # Don't over-unescape LastChange before extracting commonevent JSON; async_upnp_client often already decoded one layer.
+                    unescaped = html.unescape(raw_lastchange)
+                    self._maybe_kick_optical_from_lastchange(raw_lastchange)
                     try:
                         root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
@@ -1097,10 +1097,10 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
                 ):
-                    unescaped = html.unescape(state_variable.value)
-                    # Some firmwares include vendor common events (including
-                    # optical signal changes) inside RenderingControl LastChange.
-                    self._maybe_kick_optical_from_lastchange(unescaped)
+                    raw_lastchange = state_variable.value or ""
+                    # Don't over-unescape LastChange before extracting commonevent JSON; async_upnp_client often already decoded one layer.
+                    unescaped = html.unescape(raw_lastchange)
+                    self._maybe_kick_optical_from_lastchange(raw_lastchange)
                     try:
                         root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
@@ -1196,9 +1196,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
     def _optical_autoplay_enabled(self) -> bool:
         """Return True if optical autoplay workaround is enabled."""
-        return bool(
-            self._config_entry.options.get(CONF_OPTICAL_AUTOPLAY, DEFAULT_OPTICAL_AUTOPLAY)
-        )
+        # For this optical-autoplay build, default to enabled. If the user later
+        # explicitly disables it in the config entry options, respect that.
+        return bool(self._config_entry.options.get(CONF_OPTICAL_AUTOPLAY, True))
 
     def _schedule_optical_autoplay_kick(self, *, delay: float, reason: str) -> None:
         """Schedule a best-effort Play kick for optical input."""
@@ -1240,9 +1240,10 @@ class DlnaDmrEntity(MediaPlayerEntity):
             if (now_m - self._last_optical_signal_monotonic) > 30.0:
                 return
 
-        # Don't disturb active playback.
-        if self.state == MediaPlayerState.PLAYING:
-            return
+        # We intentionally *do not* skip when HA thinks we're already PLAYING.
+        # On some LinkPlay firmwares, the device can report PLAYING while the
+        # optical path is still muted/stalled; an explicit Play is what wakes it.
+        # (Manual Play from the HA UI produces the POST ...#Play you shared.)
 
         now = time.monotonic()
         if (now - self._last_optical_autoplay_monotonic) < OPTICAL_AUTOPLAY_COOLDOWN_SECONDS:
@@ -1270,21 +1271,31 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         Audio Pro/LinkPlay firmwares sometimes require an explicit AVTransport Play
         after the optical signal state machine reaches certain states (notably
-        `nosound` and occasionally `playing`). Triggering Play too early (e.g.
+        `playing` and occasionally `playing`). Triggering Play too early (e.g.
         while `detecting`) can be undone by the firmware once it transitions to
-        `nosound`.
+        `playing`.
         """
         if not self._optical_autoplay_enabled():
             return
 
-        # raw_lastchange is often HTML-escaped (sometimes multiple times)
-        # inside the UPnP LastChange value. Unescape iteratively.
+        # raw_lastchange is often HTML-escaped (sometimes multiple times) inside the UPnP LastChange value.
+        #
+        # IMPORTANT: We need to peel nested escaping (e.g. &amp;quot; -> &quot;, &amp;lt; -> &lt;) so we can regex the
+        # commonevent attribute value, but we must NOT fully unescape &quot; into literal quotes before extracting the
+        # attribute. If we do, the JSON quotes will break `val="..."` capture.
         _raw = raw_lastchange
         for _ in range(5):
-            _un = html.unescape(_raw)
-            if _un == _raw:
+            new_raw = (
+                _raw.replace("&amp;quot;", "&quot;")
+                .replace("&amp;lt;", "&lt;")
+                .replace("&amp;gt;", "&gt;")
+                .replace("&amp;amp;", "&amp;")
+            )
+            if new_raw == _raw:
                 break
-            _raw = _un
+            _raw = new_raw
+        # Now unescape lt/gt/amp only (leave &quot; intact until after we extract the attribute).
+        _raw = _raw.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
         # Prefer parsing the JSON-ish commonevent payload (more robust than
         # matching the raw XML/text).
@@ -1296,13 +1307,18 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 ce = html.unescape(m.group(1))
                 payload = json.loads(ce)
             else:
-                # Sometimes async_upnp_client provides commonevent directly
-                # in expanded form inside the raw string; attempt to locate
-                # the first JSON object.
-                start = _raw.find("{")
-                end = _raw.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    payload = json.loads(_raw[start : end + 1])
+                # Sometimes async_upnp_client gives us LastChange where the commonevent attribute has already
+                # been expanded/unescaped (so it's no longer valid XML). In that case, grab the first JSON
+                # object after the word 'commonevent' and parse it via JSONDecoder.raw_decode().
+                decoder = json.JSONDecoder()
+                pos = _raw.find("commonevent")
+                if pos != -1:
+                    brace = _raw.find("{", pos)
+                    if brace != -1:
+                        candidate = html.unescape(_raw[brace:])
+                        obj, _end = decoder.raw_decode(candidate)
+                        if isinstance(obj, dict):
+                            payload = obj
         except Exception:  # noqa: BLE001
             payload = None
 
@@ -1340,7 +1356,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # Update our idea of the current source from the signal-change event.
         # This helps when AVTransportURI lags or isn't emitted for inputs.
         if enabled == 1:
-            if mode in ("optical", "spdif"):
+            if mode == "optical":
                 self._linkplay_source_name = "Optical"
             elif mode in ("line-in", "linein", "aux"):
                 self._linkplay_source_name = "Line-In"
@@ -1349,13 +1365,13 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         # Track recent optical signal events to allow kicking Play even if
         # source inference lags.
-        if mode in ("optical", "spdif") and enabled == 1:
+        if mode == "optical" and enabled == 1:
             self._last_optical_signal_monotonic = time.monotonic()
             self._last_optical_signal_status = status
 
         # Only kick on end-of-detection states where Play is least likely to be
         # undone by the firmware.
-        if mode in ("optical", "spdif") and enabled == 1 and status in ("nosound", "playing"):
+        if mode == "optical" and enabled == 1 and status == "playing":
             _LOGGER.debug(
                 "Optical signal event: status=%s enabled=%s state=%s source=%s -> schedule Play",
                 status,
@@ -1440,7 +1456,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
             return "Line-In"
         if uu in ("BLUETOOTH", "BT") or ul in ("bluetooth", "bt"):
             return "Bluetooth"
-        if uu in ("OPTICAL", "SPDIF") or ul in ("optical", "spdif"):
+        if uu in ("OPTICAL",) or ul in ("optical",):
             return "Optical"
         if uu.startswith("HDMI") or "arc" in ul or ul in ("hdmi", "hdmi-arc", "hdmiarc"):
             return "HDMI ARC"
@@ -1500,7 +1516,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # AFTER the device has finished detecting the signal. We therefore do not
         # send Play immediately on switch; instead we react to RenderingControl
         # commonevent updates (audio_input_signal_changed) for Optical statuses
-        # like `nosound` or `playing`.
+        # like `playing` or `playing`.
 
     @property
     def volume_level(self) -> float | None:
