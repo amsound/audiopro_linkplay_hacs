@@ -45,6 +45,7 @@ from homeassistant.helpers.typing import VolDictType
 from .const import (
     CONF_BROWSE_UNFILTERED,
     CONF_CALLBACK_URL_OVERRIDE,
+    CONF_LISTEN_HOST,
     CONF_LISTEN_PORT,
     CONF_OPTICAL_AUTOPLAY,
     CONF_POLL_AVAILABILITY,
@@ -392,6 +393,7 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
         if user_input is not None:
             LOGGER.debug("user_input: %s", user_input)
 
+            listen_host = user_input.get(CONF_LISTEN_HOST) or None
             listen_port = user_input.get(CONF_LISTEN_PORT) or None
             callback_url_override = user_input.get(CONF_CALLBACK_URL_OVERRIDE) or None
             volume_step_pct = _normalize_volume_step_pct(
@@ -406,6 +408,7 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
             except vol.Invalid:
                 errors["base"] = "invalid_url"
 
+            options[CONF_LISTEN_HOST] = listen_host
             options[CONF_LISTEN_PORT] = listen_port
             options[CONF_CALLBACK_URL_OVERRIDE] = callback_url_override
             options[CONF_POLL_AVAILABILITY] = user_input[CONF_POLL_AVAILABILITY]
@@ -436,6 +439,7 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
                 ] = validator
 
         # listen_port can be blank or 0 for "bind any free port"
+        _add_with_suggestion(CONF_LISTEN_HOST, str)
         _add_with_suggestion(CONF_LISTEN_PORT, cv.port)
         _add_with_suggestion(CONF_CALLBACK_URL_OVERRIDE, str)
         _add_with_suggestion(CONF_POLL_AVAILABILITY, bool)
