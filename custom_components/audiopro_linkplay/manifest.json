@@ -1,7 +1,7 @@
 {
   "domain": "audiopro_linkplay",
   "name": "Audio Pro (LinkPlay)",
-  "version": "1.7",
+  "version": "1.8",
   "after_dependencies": [
     "media_source"
   ],
