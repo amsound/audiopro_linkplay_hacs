@@ -1403,16 +1403,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not mode:
             return
 
-        # Update our idea of the current source from the signal-change event.
-        # This helps when AVTransportURI lags or isn't emitted for inputs.
-        if enabled == 1:
-            if mode == "optical":
-                self._linkplay_source_name = "Optical"
-            elif mode in ("line-in", "linein", "aux"):
-                self._linkplay_source_name = "Line-In"
-            elif mode.startswith("hdmi") or mode == "arc":
-                self._linkplay_source_name = "HDMI ARC"
-
         # Track recent optical signal events to allow kicking Play even if
         # source inference lags.
         if mode == "optical" and enabled == 1:
