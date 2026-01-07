@@ -1280,14 +1280,28 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not self._device:
             return
 
-        # Prefer to only kick while on Optical, but be resilient to cases where
-        # source inference lags. If we very recently observed an optical
-        # signal-change event, allow the kick even if the current source isn't
-        # yet "Optical".
-        if self.source != "Optical":
+
+        # Only kick when we're actually on Optical.
+        #
+        # IMPORTANT: Calling AVTransport#Play while the device is still on a Wi‑Fi
+        # transport can cause some firmwares to "resume" the last stream and
+        # switch back to Wi‑Fi (the havoc you're seeing). So we confirm Optical
+        # via PlayType/TrackURI first, and if things haven't caught up yet we do
+        # one short retry instead of forcing Play immediately.
+        src_pt = self._infer_source_from_playtype(self._linkplay_playtype)
+        src_token = None
+        uri = getattr(self._device, "current_track_uri", None)
+        if isinstance(uri, str):
+            token = uri.strip()
+            if token in LINKPLAY_SOURCE_TOKEN_TO_UI:
+                src_token = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token)
+
+        is_optical = (src_pt == "Optical") or (src_token == "Optical")
+        if not is_optical:
             now_m = time.monotonic()
-            if (now_m - self._last_optical_signal_monotonic) > 30.0:
-                return
+            if (now_m - self._last_optical_signal_monotonic) < 2.0 and "waitsrc" not in reason:
+                self._schedule_optical_autoplay_kick(delay=0.4, reason=f"{reason}_waitsrc")
+            return
 
         # We intentionally *do not* skip when HA thinks we're already PLAYING.
         # On some LinkPlay firmwares, the device can report PLAYING while the
