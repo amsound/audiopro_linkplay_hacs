@@ -85,6 +85,19 @@ LINKPLAY_SOURCE_UI_TO_TOKEN: dict[str, str | None] = {
     "AirPlay": None,
 }
 
+# LinkPlay/WiiM devices expose a numeric 'PlayType' for the active input/source.
+# Prefer this over unreliable modeName strings from audio_input_signal_changed.
+PLAYTYPE_TO_SOURCE_UI: dict[int, str] = {
+    49: "HDMI ARC",
+    40: "Line-In",
+    43: "Optical",
+    41: "Bluetooth",
+    1: "AirPlay",
+    10: "Wi-Fi",
+    # 99 appears when the device is part of a multiroom group; treat as Wi‑Fi.
+    99: "Wi-Fi",
+}
+
 LINKPLAY_SOURCE_LIST: list[str] = list(LINKPLAY_SOURCE_UI_TO_TOKEN.keys())
 LINKPLAY_SOURCE_TOKEN_TO_UI: dict[str, str] = {
     token: ui for ui, token in LINKPLAY_SOURCE_UI_TO_TOKEN.items() if token
@@ -286,6 +299,8 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # LinkPlay state derived from UPnP NOTIFY/LastChange (event-driven).
         # Stored as the UI-visible source string from LINKPLAY_SOURCE_LIST.
         self._linkplay_source_name: str | None = None
+        self._linkplay_playtype: int | None = None
+        self._linkplay_playmedium: str | None = None
         # Extra artwork URL pulled from LinkPlay/AudioPro-specific UPnP actions
         # (e.g., GetInfoEx). Used as a fallback when standard DIDL metadata is
         # missing (notably during AirPlay).
@@ -947,7 +962,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 return
 
         assert self._device is not None
-
+        
         if self._resubscribe_reconnect:
             self._resubscribe_reconnect = False
             try:
@@ -955,6 +970,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 await self._device_connect(self.location)
             except UpnpError:
                 return
+
 
         try:
             do_ping = self.poll_availability or self.check_available
@@ -994,12 +1010,28 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 ):
                     force_refresh = True
 
+                # Prefer PlayType (numeric source) when available.
+                if state_variable.name == "PlayType":
+                    try:
+                        self._linkplay_playtype = int(str(state_variable.value).strip())
+                    except (TypeError, ValueError):
+                        self._linkplay_playtype = None
+                    if (src := self._infer_source_from_playtype(self._linkplay_playtype)) is not None:
+                        self._linkplay_source_name = src
+                    continue
+
+                if state_variable.name in ("PlayMedium", "PlayMediumName"):
+                    # Some firmwares expose a medium label here (e.g. OPTICAL).
+                    self._linkplay_playmedium = str(state_variable.value).strip() if state_variable.value is not None else None
+
                 # Most LinkPlay firmwares encode the current input/source in
                 # the AVTransportURI (and sometimes CurrentTrackURI) reported
                 # through the LastChange event.
                 if state_variable.name in ("AVTransportURI", "CurrentTrackURI"):
                     if isinstance(state_variable.value, str):
-                        if src := self._infer_source_from_uri(state_variable.value):
+                        # Prefer PlayType (numeric) for source detection; fall back to TrackURI/AVTransportURI.
+                        src = self._infer_source_from_playtype(self._linkplay_playtype) or self._infer_source_from_uri(state_variable.value)
+                        if src:
                             self._linkplay_source_name = src
                             self._cached_fallback_image = None
                             self._cached_media_image = None
@@ -1381,21 +1413,21 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         # Track recent optical signal events to allow kicking Play even if
         # source inference lags.
-        if mode == "optical" and enabled == 1:
-            self._last_optical_signal_monotonic = time.monotonic()
-            self._last_optical_signal_status = status
 
         # Only kick on end-of-detection states where Play is least likely to be
         # undone by the firmware.
-        if mode == "optical" and enabled == 1 and status == "playing":
+        if enabled == 1 and status == "playing":
+            self._last_optical_signal_monotonic = time.monotonic()
             _LOGGER.debug(
-                "Optical signal event: status=%s enabled=%s state=%s source=%s -> schedule Play",
+                "Audio input signal event: mode=%s status=%s enabled=%s state=%s source=%s -> schedule Play",
+                mode,
                 status,
                 enabled,
                 self.state,
                 self.source,
             )
             self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
+
 
 
     def _start_position_polling(self) -> None:
@@ -1451,6 +1483,16 @@ class DlnaDmrEntity(MediaPlayerEntity):
         else:
             self._cached_repeat = RepeatMode.OFF
 
+    def _infer_source_from_playtype(self, playtype: int | str | None) -> str | None:
+        """Infer user-facing source name from LinkPlay/WiiM PlayType."""
+        if playtype is None:
+            return None
+        try:
+            pt = int(str(playtype).strip())
+        except (TypeError, ValueError):
+            return None
+        return PLAYTYPE_TO_SOURCE_UI.get(pt)
+
     def _infer_source_from_uri(self, uri: str | None) -> str | None:
         """Infer the UI-visible source name from a LinkPlay/WiiM URI/token."""
         if not uri:
@@ -1494,16 +1536,42 @@ class DlnaDmrEntity(MediaPlayerEntity):
         """Return available inputs (LinkPlay/WiiM)."""
         return LINKPLAY_SOURCE_LIST
 
-    @property
-    def source(self) -> str | None:
-        """Return current input/source.
-        """
-        # Prefer event-derived cached source.
-        if self._linkplay_source_name:
-            return self._linkplay_source_name
 
-        # Fallback: infer from current track URI.
-        return self._infer_source_from_uri(self.media_content_id)
+def _best_source_token(self) -> str | None:
+    """Return the most reliable LinkPlay 'source token' we can infer.
+
+    Priority:
+    1) AVTransport TrackURI/AVTransportURI when it is one of LinkPlay's source tokens
+       (e.g. 'optical', 'line-in', 'bluetooth', 'wifi', 'HDMI').
+    2) Cached UI source name from audio_input_signal_changed or user selection.
+    """
+    if not self._device:
+        return None
+
+    uri = getattr(self._device, "current_track_uri", None)
+    if isinstance(uri, str):
+        token = uri.strip()
+        if token in LINKPLAY_SOURCE_TOKEN_TO_UI:
+            return token
+
+    if self._linkplay_source_name:
+        token = LINKPLAY_SOURCE_UI_TO_TOKEN.get(self._linkplay_source_name)
+        if token:
+            return token
+
+    return None
+
+@property
+def source(self) -> str | None:
+    """Name of the current source (for HA's Source selector)."""
+    token = self._best_source_token()
+    if token:
+        ui = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token, token)
+        # Keep cached UI name in sync so Source and media_content_id don't drift.
+        self._linkplay_source_name = ui
+        return ui
+
+    return self._linkplay_source_name
 
     async def async_select_source(self, source: str) -> None:
         """Select input/source via LinkPlay HTTP API.
@@ -2143,12 +2211,26 @@ class DlnaDmrEntity(MediaPlayerEntity):
         return svg.encode("utf-8")
 
 
-    @property
-    def media_content_id(self) -> str | None:
-        """Content ID of current playing media."""
-        if not self._device:
-            return None
-        return self._device.current_track_uri
+@property
+def media_content_id(self) -> str | None:
+    """Content ID of current media.
+
+    For LinkPlay optical/line-in/etc, TrackURI is often the source token itself.
+    If TrackURI is a known source token, return it; otherwise return the raw
+    TrackURI (may be a URL) or fall back to the cached source token.
+    """
+    token = self._best_source_token()
+    if token:
+        return token
+
+    if not self._device:
+        return None
+
+    uri = getattr(self._device, "current_track_uri", None)
+    if isinstance(uri, str) and uri:
+        return uri
+
+    return None
 
     @property
     def media_content_type(self) -> MediaType | None:
