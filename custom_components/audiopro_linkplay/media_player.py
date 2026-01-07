@@ -76,26 +76,25 @@ from .const import (
 # pseudo-source: it appears in automations/UI when detected, but selecting it
 # does not send any command to the device.
 LINKPLAY_SOURCE_UI_TO_TOKEN: dict[str, str | None] = {
-    "Wi-Fi": "wifi",
-    "Line-In": "line-in",
-    "Bluetooth": "bluetooth",
-    "Optical": "optical",
-    # LinkPlay switchmode token is case-sensitive on some firmwares.
-    "HDMI ARC": "HDMI",
     "AirPlay": None,
+    "Wi-Fi": "wifi",
+    "Bluetooth": "bluetooth",
+    "HDMI ARC": "HDMI",
+    "Line-In": "line-in",
+    "Optical": "optical",
 }
 
 # LinkPlay/WiiM devices expose a numeric 'PlayType' for the active input/source.
 # Prefer this over unreliable modeName strings from audio_input_signal_changed.
 PLAYTYPE_TO_SOURCE_UI: dict[int, str] = {
+    1: "AirPlay",
+    10: "Wi-Fi",
+    41: "Bluetooth",
     49: "HDMI ARC",
     40: "Line-In",
     43: "Optical",
-    41: "Bluetooth",
-    1: "AirPlay",
-    10: "Wi-Fi",
     # 99 appears when the device is part of a multiroom group; treat as Wi-Fi.
-    99: "Wi-Fi",
+    99: "Wi-Fi (grouped)",
 }
 
 LINKPLAY_SOURCE_LIST: list[str] = list(LINKPLAY_SOURCE_UI_TO_TOKEN.keys())
@@ -1542,8 +1541,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
             uri = getattr(self._device, "current_track_uri", None)
             if isinstance(uri, str):
                 token = uri.strip()
-                if token in LINKPLAY_SOURCE_TOKEN_TO_UI:
-                    src = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token, token)
+                token_key = token.lower()
+                if token_key in LINKPLAY_SOURCE_TOKEN_TO_UI:
+                    src = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token_key, token)
+                    self._linkplay_source_name = src
+                    return src
+                if (src := self._infer_source_from_uri(token)) is not None:
                     self._linkplay_source_name = src
                     return src
 
