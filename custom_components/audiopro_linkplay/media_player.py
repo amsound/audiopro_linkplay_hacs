@@ -318,7 +318,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # Last time we observed an optical signal-change event. Used as a
         # secondary guard to allow auto-Play even if source inference lags.
         self._last_optical_signal_monotonic: float = 0.0
-        self._last_optical_signal_status: str | None = None
+        self._last_optical_signal_status: str | None = "nosound"
         # Raw service on_event taps (pre-DLNA LastChange expansion). Used to
         # observe vendor commonevent payloads that async_upnp_client may not
         # expose as state variables after parsing.
@@ -1281,30 +1281,14 @@ class DlnaDmrEntity(MediaPlayerEntity):
             return
 
 
-        # Only kick when we're actually on Optical.
+                # TEST MODE: ignore current source confirmation for the optical autoplay kick.
         #
-        # IMPORTANT: Calling AVTransport#Play while the device is still on a Wi‑Fi
-        # transport can cause some firmwares to "resume" the last stream and
-        # switch back to Wi‑Fi (the havoc you're seeing). So we confirm Optical
-        # via PlayType/TrackURI first, and if things haven't caught up yet we do
-        # one short retry instead of forcing Play immediately.
-        src_pt = self._infer_source_from_playtype(self._linkplay_playtype)
-        src_token = None
-        uri = getattr(self._device, "current_track_uri", None)
-        if isinstance(uri, str):
-            token = uri.strip()
-            if token in LINKPLAY_SOURCE_TOKEN_TO_UI:
-                src_token = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token)
-
-        is_optical = (src_pt == "Optical") or (src_token == "Optical")
-        if not is_optical:
-            now_m = time.monotonic()
-            # We only press Play when Optical is confirmed by PlayType/TrackURI.
-            # If the signal event arrived first, keep retrying briefly so we catch the overlap window.
-            if (now_m - self._last_optical_signal_monotonic) < 6.0:
-                self._schedule_optical_autoplay_kick(delay=0.25, reason="waitsrc")
-            return
-
+        # We press AVTransport#Play whenever the signal logic schedules a kick.
+        # This is intentionally "blunt" for debugging.
+        #
+        # NOTE: If your firmware resumes the last Wi‑Fi stream when Play is sent
+        # on a Wi‑Fi transport, this may reintroduce the Wi‑Fi flip behavior.
+        # Keep the cooldown enabled to avoid spamming.
         # We intentionally *do not* skip when HA thinks we're already PLAYING.
         # On some LinkPlay firmwares, the device can report PLAYING while the
         # optical path is still muted/stalled; an explicit Play is what wakes it.
@@ -1418,20 +1402,30 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not mode:
             return
 
-        # Only kick on end-of-detection states where Play is least likely to be
-        # undone by the firmware.
-        if mode == "optical" and enabled == 1 and status == "playing":
-            # Arm autoplay off the reliable "playing" pulse on Optical.
-            self._last_optical_signal_monotonic = time.monotonic()
+                # Track recent optical signal events.
+        #
+        # We want to kick *only* when the optical signal transitions from
+        # `nosound` -> `playing`, because that's the narrow window where a
+        # subsequent AVTransport#Play tends to "stick" on these firmwares.
+        if mode == "optical" and enabled == 1:
+            now_m = time.monotonic()
+            prev_status = (self._last_optical_signal_status or "").strip().lower()
+
+            self._last_optical_signal_monotonic = now_m
             self._last_optical_signal_status = status
-            _LOGGER.debug(
-                "Optical signal event: status=%s enabled=%s state=%s source=%s -> schedule Play",
-                status,
-                enabled,
-                self.state,
-                self.source,
-            )
-            self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
+
+            # Trigger only on a nosound -> playing transition.
+            if prev_status == "nosound" and status == "playing":
+                _LOGGER.debug(
+                    "Optical signal transition nosound->playing: state=%s source=%s -> schedule Play",
+                    self.state,
+                    self.source,
+                )
+                self._schedule_optical_autoplay_kick(
+                    delay=0.1,
+                    reason="signal_nosound_to_playing",
+                )
+            return
 
 
     def _start_position_polling(self) -> None:
