@@ -1298,9 +1298,21 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         is_optical = (src_pt == "Optical") or (src_token == "Optical")
         if not is_optical:
+            # We only want to press Play when Optical is *actually* active.
+            #
+            # The "audio_input_signal_changed" event can arrive slightly before PlayType/TrackURI
+            # reflect the new input. If we saw a recent Optical+playing pulse, keep retrying for a
+            # short window until the source is confirmed, then send Play.
             now_m = time.monotonic()
-            if (now_m - self._last_optical_signal_monotonic) < 2.0 and "waitsrc" not in reason:
-                self._schedule_optical_autoplay_kick(delay=0.4, reason=f"{reason}_waitsrc")
+            if (
+                self._last_optical_signal_status == "playing"
+                and (now_m - self._last_optical_signal_monotonic) < 3.0
+            ):
+                m = re.search(r"_waitsrc(\d+)$", reason)
+                attempt = int(m.group(1)) if m else 0
+                base_reason = re.sub(r"_waitsrc\d+$", "", reason)
+                if attempt < 20:
+                    self._schedule_optical_autoplay_kick(delay=0.25, reason=f"{base_reason}_waitsrc{attempt + 1}")
             return
 
         # We intentionally *do not* skip when HA thinks we're already PLAYING.
@@ -1432,7 +1444,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 self.state,
                 self.source,
             )
-            self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
+            self._schedule_optical_autoplay_kick(delay=0.25, reason=f"signal_{status}")
 
 
     def _start_position_polling(self) -> None:
