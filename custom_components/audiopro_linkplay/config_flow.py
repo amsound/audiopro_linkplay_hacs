@@ -117,11 +117,13 @@ class AudioProLinkPlayFlowHandler(ConfigFlow, domain=DOMAIN):
             # Nothing found, maybe the user knows an URL to try
             return await self.async_step_manual()
 
-        self._discoveries = {
-            discovery.upnp.get(ATTR_UPNP_FRIENDLY_NAME)
-            or cast(str, urlparse(discovery.ssdp_location).hostname): discovery
-            for discovery in discoveries
-        }
+        self._discoveries = {}
+        for discovery in discoveries:
+            display_name = _format_discovery_name(discovery)
+            if display_name in self._discoveries:
+                host = urlparse(discovery.ssdp_location).hostname or discovery.ssdp_udn
+                display_name = f"{display_name} ({host})"
+            self._discoveries[display_name] = discovery
 
         data_schema = vol.Schema(
             {vol.Optional(CONF_HOST): vol.In(self._discoveries.keys())}
@@ -338,7 +340,12 @@ class AudioProLinkPlayFlowHandler(ConfigFlow, domain=DOMAIN):
             entry.unique_id
             for entry in self._async_current_entries(include_ignore=False)
         }
-        return [disc for disc in discoveries if disc.ssdp_udn not in current_unique_ids]
+        return [
+            disc
+            for disc in discoveries
+            if disc.ssdp_udn not in current_unique_ids
+            and _is_audio_pro_discovery(disc)
+        ]
 
 
 class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
@@ -472,6 +479,27 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
             data_schema=vol.Schema(fields),
             errors=errors,
         )
+
+
+def _format_discovery_name(discovery_info: SsdpServiceInfo) -> str:
+    """Format a display name for SSDP discovery list entries."""
+    name = (
+        discovery_info.upnp.get(ATTR_UPNP_FRIENDLY_NAME)
+        or urlparse(discovery_info.ssdp_location).hostname
+        or DEFAULT_NAME
+    )
+    manufacturer = (discovery_info.upnp.get(ATTR_UPNP_MANUFACTURER) or "").strip()
+    if manufacturer and manufacturer.lower() not in name.lower():
+        return f"{name} ({manufacturer})"
+    return name
+
+
+def _is_audio_pro_discovery(discovery_info: SsdpServiceInfo) -> bool:
+    """Return True if the discovery matches Audio Pro AB devices."""
+    manufacturer = (discovery_info.upnp.get(ATTR_UPNP_MANUFACTURER) or "").strip()
+    return manufacturer.lower() == "audio pro ab"
+
+
 def _is_ignored_device(discovery_info: SsdpServiceInfo) -> bool:
     """Return True if this device should be ignored for discovery.
 
