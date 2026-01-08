@@ -1298,21 +1298,11 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
         is_optical = (src_pt == "Optical") or (src_token == "Optical")
         if not is_optical:
-            # We only want to press Play when Optical is *actually* active.
-            #
-            # The "audio_input_signal_changed" event can arrive slightly before PlayType/TrackURI
-            # reflect the new input. If we saw a recent Optical+playing pulse, keep retrying for a
-            # short window until the source is confirmed, then send Play.
             now_m = time.monotonic()
-            if (
-                self._last_optical_signal_status == "playing"
-                and (now_m - self._last_optical_signal_monotonic) < 3.0
-            ):
-                m = re.search(r"_waitsrc(\d+)$", reason)
-                attempt = int(m.group(1)) if m else 0
-                base_reason = re.sub(r"_waitsrc\d+$", "", reason)
-                if attempt < 20:
-                    self._schedule_optical_autoplay_kick(delay=0.25, reason=f"{base_reason}_waitsrc{attempt + 1}")
+            # We only press Play when Optical is confirmed by PlayType/TrackURI.
+            # If the signal event arrived first, keep retrying briefly so we catch the overlap window.
+            if (now_m - self._last_optical_signal_monotonic) < 6.0:
+                self._schedule_optical_autoplay_kick(delay=0.25, reason="waitsrc")
             return
 
         # We intentionally *do not* skip when HA thinks we're already PLAYING.
@@ -1428,15 +1418,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
         if not mode:
             return
 
-        # Track recent optical signal events to allow kicking Play even if
-        # source inference lags.
-        if mode == "optical" and enabled == 1:
-            self._last_optical_signal_monotonic = time.monotonic()
-            self._last_optical_signal_status = status
-
         # Only kick on end-of-detection states where Play is least likely to be
         # undone by the firmware.
         if mode == "optical" and enabled == 1 and status == "playing":
+            # Arm autoplay off the reliable "playing" pulse on Optical.
+            self._last_optical_signal_monotonic = time.monotonic()
+            self._last_optical_signal_status = status
             _LOGGER.debug(
                 "Optical signal event: status=%s enabled=%s state=%s source=%s -> schedule Play",
                 status,
@@ -1444,7 +1431,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 self.state,
                 self.source,
             )
-            self._schedule_optical_autoplay_kick(delay=0.25, reason=f"signal_{status}")
+            self._schedule_optical_autoplay_kick(delay=0.4, reason=f"signal_{status}")
 
 
     def _start_position_polling(self) -> None:
