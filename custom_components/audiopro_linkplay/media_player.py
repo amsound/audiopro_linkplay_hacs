@@ -1134,12 +1134,31 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra state attributes."""
-        attrs: dict[str, Any] = {}
-        if self._linkplay_playtype_raw is not None:
-            attrs["linkplay_playtype"] = self._linkplay_playtype_raw
+        """Expose LinkPlay source decision inputs."""
+        attrs: dict[str, Any] = dict(super().extra_state_attributes or {})
+
+        # Signals used to infer the active source
+        if self._linkplay_playtype is not None:
+            attrs["linkplay_playtype"] = self._linkplay_playtype  # <-- numeric only
+
+        if self._linkplay_playmedium is not None:
+            attrs["linkplay_playmedium"] = self._linkplay_playmedium
+
         if self._linkplay_track_uri_raw is not None:
             attrs["linkplay_track_uri"] = self._linkplay_track_uri_raw
+
+        # What the integration inferred from the above
+        if self._linkplay_source_name is not None:
+            attrs["linkplay_source_inferred"] = self._linkplay_source_name
+
+        # Optional: keep them grouped too
+        media_extra = dict(attrs.get(ATTR_MEDIA_EXTRA) or {})
+        for k in ("linkplay_playtype", "linkplay_playmedium", "linkplay_track_uri", "linkplay_source_inferred"):
+            if k in attrs:
+                media_extra[k] = attrs[k]
+        if media_extra:
+            attrs[ATTR_MEDIA_EXTRA] = media_extra
+
         return attrs
 
 
