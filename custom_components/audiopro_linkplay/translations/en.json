@@ -49,7 +49,6 @@
         "title": "Audio Pro (LinkPlay) configuration",
         "data": {
           "volume_step_pct": "Volume step (1–5%)",
-          "optical_autoplay": "Optical: auto-play with valid signal",
           "callback_url_override": "Event listener callback URL",
           "listen_host": "Event listener listen host (optional)",
           "listen_port": "Event listener port (random if not set)",
