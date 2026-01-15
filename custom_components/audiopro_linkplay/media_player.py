@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 import contextlib
 import html
-import time
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -51,15 +49,12 @@ from .const import (
     CONF_CALLBACK_URL_OVERRIDE,
     CONF_LISTEN_HOST,
     CONF_LISTEN_PORT,
-    CONF_OPTICAL_AUTOPLAY,
     CONF_POLL_AVAILABILITY,
     CONF_VOLUME_STEP_PCT,
     DOMAIN,
-    DEFAULT_OPTICAL_AUTOPLAY,
     DEFAULT_VOLUME_STEP_PCT,
     MAX_VOLUME_STEP_PCT,
     MIN_VOLUME_STEP_PCT,
-    OPTICAL_AUTOPLAY_COOLDOWN_SECONDS,
     LOGGER as _LOGGER,
     MEDIA_METADATA_DIDL,
     MEDIA_TYPE_MAP,
@@ -309,21 +304,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_media_image: tuple[str, bytes, str] | None = None
         self._cached_fallback_image: tuple[str, bytes] | None = None
         self._cached_icon_image: bytes | None = None
-
-        # Optical input firmware workaround: some devices require a Play after
-        # switching (or when optical signal returns) to actually open the audio
-        # path.
-        self._last_optical_autoplay_monotonic: float = 0.0
-        self._pending_optical_autoplay_task: asyncio.Task[None] | None = None
-        # Last time we observed an optical signal-change event. Used as a
-        # secondary guard to allow auto-Play even if source inference lags.
-        self._last_optical_signal_monotonic: float = 0.0
-        self._last_optical_signal_status: str | None = "nosound"
-        # Raw service on_event taps (pre-DLNA LastChange expansion). Used to
-        # observe vendor commonevent payloads that async_upnp_client may not
-        # expose as state variables after parsing.
-        self._tapped_services: dict[UpnpService, Any] = {}
-
 
         self._background_setup_task: asyncio.Task[None] | None = None
         self._updated_registry: bool = False
@@ -739,72 +719,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
         super().async_write_ha_state()
 
 
-    def _install_raw_notify_taps(self, upnp_device: Any) -> None:
-        """Install raw NOTIFY taps on services before DLNA LastChange expansion.
-
-        async_upnp_client's DLNA profile parses RenderingControl/AVTransport
-        LastChange and may drop vendor-specific fields like `commonevent`.
-        We wrap the underlying service.on_event callback to observe the raw
-        state variables and extract optical signal changes reliably.
-        """
-        try:
-            services_obj = getattr(upnp_device, "services", None)
-            if isinstance(services_obj, dict):
-                services = list(services_obj.values())
-            elif services_obj is None:
-                services = []
-            else:
-                services = list(services_obj)
-        except Exception:  # noqa: BLE001
-            services = []
-
-        for svc in services:
-            st = (getattr(svc, "service_type", "") or "")
-            sid = (getattr(svc, "service_id", "") or "")
-            if "RenderingControl" not in st and "RenderingControl" not in sid:
-                continue
-            if svc in self._tapped_services:
-                continue
-
-            orig = getattr(svc, "on_event", None)
-            self._tapped_services[svc] = orig
-
-            def _wrapped(service: UpnpService, state_vars: Sequence[UpnpStateVariable], *, _orig=orig) -> None:
-                try:
-                    for sv in state_vars:
-                        if not isinstance(sv.value, str):
-                            continue
-                        name = (sv.name or "")
-                        # Look for vendor signal notifications either embedded in
-                        # LastChange or provided directly as commonevent.
-                        if name in ("LastChange", "commonevent"):
-                            raw = sv.value
-                            # Cheap check before doing heavier parsing.
-                            if "audio_input_signal_changed" in raw or "audio_input_signal_changed" in html.unescape(raw):
-                                _LOGGER.debug(
-                                    "Raw RenderingControl %s observed (contains audio_input_signal_changed)",
-                                    name,
-                                )
-                                self._maybe_kick_optical_from_lastchange(raw)
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("Error in raw RenderingControl event tap: %s", err)
-
-                if callable(_orig):
-                    try:
-                        _orig(service, state_vars)
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug("Error in original RenderingControl on_event: %s", err)
-
-            try:
-                svc.on_event = _wrapped
-                _LOGGER.debug(
-                    "Installed raw NOTIFY tap on RenderingControl: service_id=%s service_type=%s",
-                    sid,
-                    st,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Failed to install raw NOTIFY tap on RenderingControl: %s", err)
-
     async def _device_connect(self, location: str) -> None:
         """Connect to the device now that it's available."""
         _LOGGER.debug("Connecting to device at %s", location)
@@ -832,9 +746,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
             # Create profile wrapper
             self._device = DmrDevice(upnp_device, event_handler)
-
-            # Tap raw service events to capture vendor commonevent payloads.
-            self._install_raw_notify_taps(upnp_device)
 
             self.location = location
 
@@ -926,15 +837,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 return
 
             _LOGGER.debug("Disconnecting from %s", self._device.name)
-
-            # Restore any tapped service callbacks (best-effort).
-            for svc, orig in list(self._tapped_services.items()):
-                try:
-                    svc.on_event = orig
-                except Exception:  # noqa: BLE001
-                    pass
-            self._tapped_services.clear()
-
 
             # Event-driven state; nothing to stop here beyond UPnP subscriptions.
 
@@ -1040,9 +942,8 @@ class DlnaDmrEntity(MediaPlayerEntity):
                     state_variable.value, str
                 ):
                     raw_lastchange = state_variable.value or ""
-                    # Don't over-unescape LastChange before extracting commonevent JSON; async_upnp_client often already decoded one layer.
+                    # Don't over-unescape LastChange; async_upnp_client often already decoded one layer.
                     unescaped = html.unescape(raw_lastchange)
-                    self._maybe_kick_optical_from_lastchange(raw_lastchange)
                     try:
                         root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
@@ -1135,21 +1036,12 @@ class DlnaDmrEntity(MediaPlayerEntity):
                     if (v := _coerce_volume(state_variable.value)) is not None:
                         self._cached_volume_level = v
 
-                # Some firmwares (and async_upnp_client) expand the RenderingControl
-                # LastChange and provide vendor common events directly as a
-                # `commonevent` state variable. Handle this path as well.
-                if state_variable.name == "commonevent" and isinstance(
-                    state_variable.value, str
-                ):
-                    self._maybe_kick_optical_from_lastchange(state_variable.value)
-
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
                 ):
                     raw_lastchange = state_variable.value or ""
-                    # Don't over-unescape LastChange before extracting commonevent JSON; async_upnp_client often already decoded one layer.
+                    # Don't over-unescape LastChange; async_upnp_client often already decoded one layer.
                     unescaped = html.unescape(raw_lastchange)
-                    self._maybe_kick_optical_from_lastchange(raw_lastchange)
                     try:
                         root = ET.fromstring(unescaped)
                     except Exception:  # noqa: BLE001
@@ -1242,191 +1134,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
                     await resp.read()
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("LinkPlay HTTP API call failed (%s): %s", url, err)
-
-    def _optical_autoplay_enabled(self) -> bool:
-        """Return True if optical autoplay workaround is enabled."""
-        # For this optical-autoplay build, default to enabled. If the user later
-        # explicitly disables it in the config entry options, respect that.
-        return bool(self._config_entry.options.get(CONF_OPTICAL_AUTOPLAY, True))
-
-    def _schedule_optical_autoplay_kick(self, *, delay: float, reason: str) -> None:
-        """Schedule a best-effort Play kick for optical input."""
-        if not self._optical_autoplay_enabled():
-            return
-
-        # Cancel any pending kick and schedule a new one.
-        if self._pending_optical_autoplay_task is not None:
-            self._pending_optical_autoplay_task.cancel()
-            self._pending_optical_autoplay_task = None
-
-        async def _runner() -> None:
-            try:
-                if delay:
-                    await asyncio.sleep(delay)
-                await self._async_optical_autoplay_kick(reason=reason)
-            except asyncio.CancelledError:
-                return
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Optical autoplay kick failed: %s", err)
-
-        self._pending_optical_autoplay_task = self.hass.async_create_task(_runner())
-
-    async def _async_optical_autoplay_kick(self, *, reason: str) -> None:
-        """Send a UPnP Play to open the optical audio path.
-
-        Some firmwares require a Play after switching to Optical or after the
-        optical signal becomes present again.
-        """
-        if not self._device:
-            return
-
-
-                # TEST MODE: ignore current source confirmation for the optical autoplay kick.
-        #
-        # We press AVTransport#Play whenever the signal logic schedules a kick.
-        # This is intentionally "blunt" for debugging.
-        #
-        # NOTE: If your firmware resumes the last Wi‑Fi stream when Play is sent
-        # on a Wi‑Fi transport, this may reintroduce the Wi‑Fi flip behavior.
-        # Keep the cooldown enabled to avoid spamming.
-        # We intentionally *do not* skip when HA thinks we're already PLAYING.
-        # On some LinkPlay firmwares, the device can report PLAYING while the
-        # optical path is still muted/stalled; an explicit Play is what wakes it.
-        # (Manual Play from the HA UI produces the POST ...#Play you shared.)
-
-        now = time.monotonic()
-        if (now - self._last_optical_autoplay_monotonic) < OPTICAL_AUTOPLAY_COOLDOWN_SECONDS:
-            return
-        self._last_optical_autoplay_monotonic = now
-
-        _LOGGER.debug(
-            "Optical autoplay: sending Play (reason=%s, source=%s, state=%s, last_signal=%s)",
-            reason,
-            self.source,
-            self.state,
-            self._last_optical_signal_status,
-        )
-
-        # Use AVTransport#Play (UPnP), mirroring the vendor apps.
-        await self._async_call_action(
-            "urn:schemas-upnp-org:service:AVTransport:1",
-            "Play",
-            InstanceID=0,
-            Speed="1",
-        )
-
-    def _maybe_kick_optical_from_lastchange(self, raw_lastchange: str) -> None:
-        """Detect optical-signal events in LastChange and kick Play if needed.
-
-        Audio Pro/LinkPlay firmwares sometimes require an explicit AVTransport Play
-        after the optical signal state machine reaches certain states (notably
-        `playing` and occasionally `playing`). Triggering Play too early (e.g.
-        while `detecting`) can be undone by the firmware once it transitions to
-        `playing`.
-        """
-        if not self._optical_autoplay_enabled():
-            return
-
-        # raw_lastchange is often HTML-escaped (sometimes multiple times) inside the UPnP LastChange value.
-        #
-        # IMPORTANT: We need to peel nested escaping (e.g. &amp;quot; -> &quot;, &amp;lt; -> &lt;) so we can regex the
-        # commonevent attribute value, but we must NOT fully unescape &quot; into literal quotes before extracting the
-        # attribute. If we do, the JSON quotes will break `val="..."` capture.
-        _raw = raw_lastchange
-        for _ in range(5):
-            new_raw = (
-                _raw.replace("&amp;quot;", "&quot;")
-                .replace("&amp;lt;", "&lt;")
-                .replace("&amp;gt;", "&gt;")
-                .replace("&amp;amp;", "&amp;")
-            )
-            if new_raw == _raw:
-                break
-            _raw = new_raw
-        # Now unescape lt/gt/amp only (leave &quot; intact until after we extract the attribute).
-        _raw = _raw.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-
-        # Prefer parsing the JSON-ish commonevent payload (more robust than
-        # matching the raw XML/text).
-        payload: dict[str, Any] | None = None
-        try:
-            # Extract the commonevent attribute value if present.
-            m = re.search(r"commonevent[^>]*\sval=\"([^\"]+)\"", _raw)
-            if m:
-                ce = html.unescape(m.group(1))
-                payload = json.loads(ce)
-            else:
-                # Sometimes async_upnp_client gives us LastChange where the commonevent attribute has already
-                # been expanded/unescaped (so it's no longer valid XML). In that case, grab the first JSON
-                # object after the word 'commonevent' and parse it via JSONDecoder.raw_decode().
-                decoder = json.JSONDecoder()
-                pos = _raw.find("commonevent")
-                if pos != -1:
-                    brace = _raw.find("{", pos)
-                    if brace != -1:
-                        candidate = html.unescape(_raw[brace:])
-                        obj, _end = decoder.raw_decode(candidate)
-                        if isinstance(obj, dict):
-                            payload = obj
-        except Exception:  # noqa: BLE001
-            payload = None
-
-        category = None
-        changed = None
-        if isinstance(payload, dict):
-            category = str(payload.get("category") or "").lower()
-            body = payload.get("body") or {}
-            if isinstance(body, dict):
-                changed = body.get("changed")
-
-        if category != "audio_input_signal_changed" or not isinstance(changed, dict):
-            # Fallback: regex match on the raw payload.
-            raw = _raw.lower()
-            if "audio_input_signal_changed" not in raw:
-                return
-            m_mode = re.search(r"\"modename\"\s*:\s*\"([^\"]+)\"", raw)
-            mode = (m_mode.group(1) if m_mode else "").strip().lower()
-            m_status = re.search(r"\"contentstatus\"\s*:\s*\"([^\"]+)\"", raw)
-            status = (m_status.group(1) if m_status else "").strip().lower()
-            m_en = re.search(r"\"contentenable\"\s*:\s*(\d+)", raw)
-            enabled = int(m_en.group(1)) if m_en else None
-        else:
-            mode = str(changed.get("modeName") or "").strip().lower()
-            status = str(changed.get("contentStatus") or "").strip().lower()
-            enabled = changed.get("contentEnable")
-            try:
-                enabled = int(enabled) if enabled is not None else None
-            except Exception:  # noqa: BLE001
-                enabled = None
-
-        if not mode:
-            return
-
-                # Track recent optical signal events.
-        #
-        # We want to kick *only* when the optical signal transitions from
-        # `nosound` -> `playing`, because that's the narrow window where a
-        # subsequent AVTransport#Play tends to "stick" on these firmwares.
-        if mode == "optical" and enabled == 1:
-            now_m = time.monotonic()
-            prev_status = (self._last_optical_signal_status or "").strip().lower()
-
-            self._last_optical_signal_monotonic = now_m
-            self._last_optical_signal_status = status
-
-            # Trigger only on a nosound -> playing transition.
-            if prev_status == "nosound" and status == "playing":
-                _LOGGER.debug(
-                    "Optical signal transition nosound->playing: state=%s source=%s -> schedule Play",
-                    self.state,
-                    self.source,
-                )
-                self._schedule_optical_autoplay_kick(
-                    delay=0.1,
-                    reason="signal_nosound_to_playing",
-                )
-            return
-
 
     def _start_position_polling(self) -> None:
         """Poll position every 5s while playing (fallback for devices with flaky eventing)."""
@@ -1585,13 +1292,6 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_fallback_image = None
         self._cached_media_image = None
         self.async_write_ha_state()
-
-        # Optical input firmware workaround:
-        # Some firmwares pause/stop the optical path unless they receive a Play
-        # AFTER the device has finished detecting the signal. We therefore do not
-        # send Play immediately on switch; instead we react to RenderingControl
-        # commonevent updates (audio_input_signal_changed) for Optical statuses
-        # like `playing` or `playing`.
 
     @property
     def volume_level(self) -> float | None:

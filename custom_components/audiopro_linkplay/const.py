@@ -27,14 +27,6 @@ DEFAULT_VOLUME_STEP_PCT: Final = 2
 MIN_VOLUME_STEP_PCT: Final = 1
 MAX_VOLUME_STEP_PCT: Final = 5
 
-# Work around firmware bug where switching to Optical requires a subsequent
-# "Play" to open the audio path.
-CONF_OPTICAL_AUTOPLAY: Final = "optical_autoplay"
-DEFAULT_OPTICAL_AUTOPLAY: Final = True
-
-# Rate-limit autoplay kicks to avoid spamming the device.
-OPTICAL_AUTOPLAY_COOLDOWN_SECONDS: Final = 5.0
-
 DEFAULT_NAME: Final = "Audio Pro (LinkPlay)"
 
 CONNECT_TIMEOUT: Final = 10

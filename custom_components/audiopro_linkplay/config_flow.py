@@ -47,10 +47,8 @@ from .const import (
     CONF_CALLBACK_URL_OVERRIDE,
     CONF_LISTEN_HOST,
     CONF_LISTEN_PORT,
-    CONF_OPTICAL_AUTOPLAY,
     CONF_POLL_AVAILABILITY,
     CONF_VOLUME_STEP_PCT,
-    DEFAULT_OPTICAL_AUTOPLAY,
     DEFAULT_VOLUME_STEP_PCT,
     MAX_VOLUME_STEP_PCT,
     MIN_VOLUME_STEP_PCT,
@@ -420,9 +418,6 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
             options[CONF_CALLBACK_URL_OVERRIDE] = callback_url_override
             options[CONF_POLL_AVAILABILITY] = user_input[CONF_POLL_AVAILABILITY]
             options[CONF_BROWSE_UNFILTERED] = user_input[CONF_BROWSE_UNFILTERED]
-            options[CONF_OPTICAL_AUTOPLAY] = user_input.get(
-                CONF_OPTICAL_AUTOPLAY, DEFAULT_OPTICAL_AUTOPLAY
-            )
             options[CONF_VOLUME_STEP_PCT] = volume_step_pct
 
             # Save if there's no errors, else fall through and show the form again
@@ -451,15 +446,6 @@ class AudioProLinkPlayOptionsFlowHandler(OptionsFlow):
         _add_with_suggestion(CONF_CALLBACK_URL_OVERRIDE, str)
         _add_with_suggestion(CONF_POLL_AVAILABILITY, bool)
         _add_with_suggestion(CONF_BROWSE_UNFILTERED, bool)
-
-        # Workaround for firmware bug: switching to Optical may require a
-        # subsequent Play to open the audio path.
-        fields[
-            vol.Required(
-                CONF_OPTICAL_AUTOPLAY,
-                default=options.get(CONF_OPTICAL_AUTOPLAY, DEFAULT_OPTICAL_AUTOPLAY),
-            )
-        ] = bool
 
         # Volume step as percent (1..5), shown as a slider.
         fields[vol.Required(CONF_VOLUME_STEP_PCT, default=volume_step_pct)] = (
