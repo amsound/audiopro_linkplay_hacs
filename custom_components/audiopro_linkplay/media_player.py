@@ -969,6 +969,17 @@ class DlnaDmrEntity(MediaPlayerEntity):
                         elif name == "CurrentTrackURI":
                             track_uri = el.attrib.get("val")
                             self._linkplay_track_uri_raw = track_uri
+                        elif name == "PlayType":
+                            raw_playtype = el.attrib.get("val") or el.text
+                            if raw_playtype is None:
+                                self._linkplay_playtype_raw = None
+                                self._linkplay_playtype = None
+                            else:
+                                self._linkplay_playtype_raw = str(raw_playtype)
+                                try:
+                                    self._linkplay_playtype = int(str(raw_playtype).strip())
+                                except (TypeError, ValueError):
+                                    self._linkplay_playtype = None
                         elif name == "LoopMode":
                             self._update_cached_loop_mode(el.attrib.get("val") or el.text)
 
