@@ -281,7 +281,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._cached_is_muted: bool | None = None
 
         self._linkplay_playtype: int | None = None
+        self._linkplay_playtype_raw: str | None = None
         self._linkplay_playmedium: str | None = None
+        self._linkplay_track_uri_raw: str | None = None
         # Cache volume level locally because some LinkPlay/AudioPro devices
         # only report volume inside RenderingControl LastChange events.
         self._cached_volume_level: float | None = None
@@ -882,6 +884,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
         finally:
             self.check_available = False
 
+        if isinstance(getattr(self._device, "current_track_uri", None), str):
+            self._linkplay_track_uri_raw = self._device.current_track_uri
+
         # Supported features may have changed
     def _on_event(
         self, service: UpnpService, state_variables: Sequence[UpnpStateVariable]
@@ -913,6 +918,10 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
                 # Prefer PlayType (numeric source) when available.
                 if state_variable.name == "PlayType":
+                    if state_variable.value is None:
+                        self._linkplay_playtype_raw = None
+                    else:
+                        self._linkplay_playtype_raw = str(state_variable.value)
                     try:
                         self._linkplay_playtype = int(str(state_variable.value).strip())
                     except (TypeError, ValueError):
@@ -932,6 +941,8 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 # through the LastChange event.
                 if state_variable.name in ("AVTransportURI", "CurrentTrackURI"):
                     if isinstance(state_variable.value, str):
+                        if state_variable.name == "CurrentTrackURI":
+                            self._linkplay_track_uri_raw = state_variable.value
                         src = self._infer_source_from_playtype(self._linkplay_playtype) or self._infer_source_from_uri(state_variable.value)
                         if src:
                             self._linkplay_source_name = src
@@ -957,6 +968,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
                             av_uri = el.attrib.get("val")
                         elif name == "CurrentTrackURI":
                             track_uri = el.attrib.get("val")
+                            self._linkplay_track_uri_raw = track_uri
                         elif name == "LoopMode":
                             self._update_cached_loop_mode(el.attrib.get("val") or el.text)
 
@@ -1108,6 +1120,16 @@ class DlnaDmrEntity(MediaPlayerEntity):
         return _TRANSPORT_STATE_TO_MEDIA_PLAYER_STATE.get(
             self._device.transport_state, MediaPlayerState.IDLE
         )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes."""
+        attrs: dict[str, Any] = {}
+        if self._linkplay_playtype_raw is not None:
+            attrs["linkplay_playtype"] = self._linkplay_playtype_raw
+        if self._linkplay_track_uri_raw is not None:
+            attrs["linkplay_track_uri"] = self._linkplay_track_uri_raw
+        return attrs
 
 
     def _linkplay_host(self) -> str | None:
