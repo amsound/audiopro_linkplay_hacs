@@ -67,35 +67,50 @@ from .const import (
 # LinkPlay/WiiM HTTP API additions
 #
 # We expose friendly, stable source names to Home Assistant, and map them to
-# LinkPlay switchmode tokens. "AirPlay" is intentionally a *visibility-only*
-# pseudo-source: it appears in automations/UI when detected, but selecting it
-# does not send any command to the device.
+# LinkPlay switchmode tokens.
+#
+# Notes:
+# - "AirPlay" is intentionally a *visibility-only* pseudo-source: it may appear
+#   as the current source but selecting it does not send any command.
+# - "Multiroom (Secondary)" is also visibility-only: it indicates the device is
+#   acting as a secondary speaker in a multiroom group.
 LINKPLAY_SOURCE_UI_TO_TOKEN: dict[str, str | None] = {
-    "AirPlay": None,
+    # Switchable inputs
     "Wi-Fi": "wifi",
     "Bluetooth": "bluetooth",
     "HDMI ARC": "HDMI",
     "Line-In": "line-in",
     "Optical": "optical",
-}
-
-# LinkPlay/WiiM devices expose a numeric 'PlayType' for the active input/source.
-# Prefer this over unreliable modeName strings from audio_input_signal_changed.
-PLAYTYPE_TO_SOURCE_UI: dict[int, str] = {
-    1: "AirPlay",
-    10: "Wi-Fi",
-    41: "Bluetooth",
-    49: "HDMI ARC",
-    40: "Line-In",
-    43: "Optical",
-    # 99 appears when the device is part of a multiroom group; treat as Wi-Fi.
-    99: "Wi-Fi (grouped)",
+    # Visibility-only states
+    "AirPlay": None,
+    "Multiroom (Secondary)": None,
 }
 
 LINKPLAY_SOURCE_LIST: list[str] = list(LINKPLAY_SOURCE_UI_TO_TOKEN.keys())
 LINKPLAY_SOURCE_TOKEN_TO_UI: dict[str, str] = {
-    token: ui for ui, token in LINKPLAY_SOURCE_UI_TO_TOKEN.items() if token
+    token.lower(): ui for ui, token in LINKPLAY_SOURCE_UI_TO_TOKEN.items() if token
 }
+
+# AVTransport LastChange fields used for source detection.
+#
+# Prefer PlaybackStorageMedium and fall back to CurrentTrackURI/AVTransportURI.
+LINKPLAY_PLAYBACK_STORAGE_MEDIUM_TO_SOURCE_UI: dict[str, str] = {
+    # Switchable inputs
+    "HDMI": "HDMI ARC",
+    "OPTICAL": "Optical",
+    "LINE-IN": "Line-In",
+    "BLUETOOTH": "Bluetooth",
+    "RADIO-NETWORK": "Wi-Fi",
+    "SONGLIST-NETWORK": "Wi-Fi",
+
+    # Visibility-only states
+    "AIRPLAY": "AirPlay",
+    "MULTIROOM-SLAVE": "Multiroom (Secondary)",
+}
+
+# Some firmwares mirror PlaybackStorageMedium into URI fields.
+# Treat any token starting with SONGLIST- or ending in -NETWORK as Wi-Fi.
+LINKPLAY_NETWORK_TOKEN_PREFIXES: tuple[str, ...] = ("SONGLIST-",)
 LINKPLAY_PRESET_MODES: list[str] = [f"Preset {i}" for i in range(1, 7)]
 LINKPLAY_HTTPAPI_PATH = "/httpapi.asp"
 LINKPLAY_HTTP_TIMEOUT = 10
@@ -280,10 +295,19 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # don't reliably report mute state via GENA events.
         self._cached_is_muted: bool | None = None
 
-        self._linkplay_playtype: int | None = None
-        self._linkplay_playtype_raw: str | None = None
-        self._linkplay_playmedium: str | None = None
-        self._linkplay_track_uri_raw: str | None = None
+        # LinkPlay/WiiM source + metadata extracted from AVTransport LastChange.
+        # We prefer PlaybackStorageMedium and fall back to CurrentTrackURI/
+        # AVTransportURI.
+        self._linkplay_playback_storage_medium: str | None = None
+        self._linkplay_current_track_uri: str | None = None
+        self._linkplay_avtransport_uri: str | None = None
+        self._linkplay_track_source: str | None = None
+
+        # Audio quality (best-effort) parsed from embedded DIDL metadata.
+        self._linkplay_audio_rate_hz: int | None = None
+        self._linkplay_audio_format_bits: int | None = None
+        self._linkplay_audio_bitrate_kbps: int | None = None
+        self._linkplay_last_metadata: str | None = None
         # Cache volume level locally because some LinkPlay/AudioPro devices
         # only report volume inside RenderingControl LastChange events.
         self._cached_volume_level: float | None = None
@@ -884,10 +908,11 @@ class DlnaDmrEntity(MediaPlayerEntity):
         finally:
             self.check_available = False
 
+        # Best-effort fallback: some firmwares surface CurrentTrackURI on the
+        # profile object even when eventing is flaky.
         if isinstance(getattr(self._device, "current_track_uri", None), str):
-            self._linkplay_track_uri_raw = self._device.current_track_uri
+            self._linkplay_current_track_uri = self._device.current_track_uri
 
-        # Supported features may have changed
     def _on_event(
         self, service: UpnpService, state_variables: Sequence[UpnpStateVariable]
     ) -> None:
@@ -904,7 +929,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # Some LinkPlay firmwares use non-standard service_id values; match by substring too.
 
 
-        # LinkPlay/WiiM state is primarily ...
+        # LinkPlay/WiiM state is primarily driven by AVTransport LastChange.
+        # We prefer PlaybackStorageMedium and fall back to CurrentTrackURI/
+        # AVTransportURI.
         if "AVTransport" in svc_type or "AVTransport" in svc_id:
             for state_variable in state_variables:
                 # Force a state refresh when player begins or pauses playback
@@ -915,39 +942,38 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 ):
                     force_refresh = True
 
-
-                # Prefer PlayType (numeric source) when available.
-                if state_variable.name == "PlayType":
-                    if state_variable.value is None:
-                        self._linkplay_playtype_raw = None
-                    else:
-                        self._linkplay_playtype_raw = str(state_variable.value)
-                    try:
-                        self._linkplay_playtype = int(str(state_variable.value).strip())
-                    except (TypeError, ValueError):
-                        self._linkplay_playtype = None
-                    if (src := self._infer_source_from_playtype(self._linkplay_playtype)) is not None:
-                        self._linkplay_source_name = src
+                # Some firmwares surface these fields directly.
+                if state_variable.name == "PlaybackStorageMedium":
+                    self._linkplay_playback_storage_medium = self._normalize_lastchange_value(
+                        state_variable.value
+                    )
+                    self._maybe_update_linkplay_source()
                     continue
 
-                if state_variable.name in ("PlayMedium", "PlayMediumName"):
-                    # Some firmwares expose a medium label here (e.g. OPTICAL).
-                    self._linkplay_playmedium = (
-                        str(state_variable.value).strip() if state_variable.value is not None else None
+                if state_variable.name == "TrackSource":
+                    self._linkplay_track_source = self._normalize_lastchange_value(
+                        state_variable.value
                     )
+                    continue
 
-                # Most LinkPlay firmwares encode the current input/source in
-                # the AVTransportURI (and sometimes CurrentTrackURI) reported
-                # through the LastChange event.
+                if state_variable.name in ("CurrentTrackMetaData", "TrackMetaData", "AVTransportURIMetaData"):
+                    # Some firmwares expose metadata directly (not only inside LastChange).
+                    self._update_audio_quality_from_metadata(
+                        state_variable.value if isinstance(state_variable.value, str) else None
+                    )
+                    continue
+
                 if state_variable.name in ("AVTransportURI", "CurrentTrackURI"):
                     if isinstance(state_variable.value, str):
                         if state_variable.name == "CurrentTrackURI":
-                            self._linkplay_track_uri_raw = state_variable.value
-                        src = self._infer_source_from_playtype(self._linkplay_playtype) or self._infer_source_from_uri(state_variable.value)
-                        if src:
-                            self._linkplay_source_name = src
-                            self._cached_fallback_image = None
-                            self._cached_media_image = None
+                            self._linkplay_current_track_uri = self._normalize_lastchange_value(
+                                state_variable.value
+                            )
+                        else:
+                            self._linkplay_avtransport_uri = self._normalize_lastchange_value(
+                                state_variable.value
+                            )
+                        self._maybe_update_linkplay_source()
 
                 if state_variable.name == "LastChange" and isinstance(
                     state_variable.value, str
@@ -960,34 +986,58 @@ class DlnaDmrEntity(MediaPlayerEntity):
                     except Exception:  # noqa: BLE001
                         continue
 
-                    av_uri: str | None = None
-                    track_uri: str | None = None
+                    saw_meta = False
+                    track_metadata: str | None = None
+                    av_metadata: str | None = None
+
                     for el in root.iter():
                         name = self._localname(el.tag)
-                        if name == "AVTransportURI":
-                            av_uri = el.attrib.get("val")
+
+                        if name == "PlaybackStorageMedium":
+                            self._linkplay_playback_storage_medium = self._normalize_lastchange_value(
+                                el.attrib.get("val") or el.text
+                            )
+                        elif name == "TrackSource":
+                            self._linkplay_track_source = self._normalize_lastchange_value(
+                                el.attrib.get("val") or el.text
+                            )
+                        elif name == "AVTransportURI":
+                            self._linkplay_avtransport_uri = self._normalize_lastchange_value(
+                                el.attrib.get("val") or el.text
+                            )
                         elif name == "CurrentTrackURI":
-                            track_uri = el.attrib.get("val")
-                            self._linkplay_track_uri_raw = track_uri
-                        elif name == "PlayType":
-                            raw_playtype = el.attrib.get("val") or el.text
-                            if raw_playtype is None:
-                                self._linkplay_playtype_raw = None
-                                self._linkplay_playtype = None
-                            else:
-                                self._linkplay_playtype_raw = str(raw_playtype)
-                                try:
-                                    self._linkplay_playtype = int(str(raw_playtype).strip())
-                                except (TypeError, ValueError):
-                                    self._linkplay_playtype = None
+                            self._linkplay_current_track_uri = self._normalize_lastchange_value(
+                                el.attrib.get("val") or el.text
+                            )
+                        elif name == "CurrentTrackMetaData":
+                            saw_meta = True
+                            track_metadata = el.attrib.get("val") or el.text
+                        elif name == "AVTransportURIMetaData":
+                            saw_meta = True
+                            av_metadata = el.attrib.get("val") or el.text
                         elif name == "LoopMode":
                             self._update_cached_loop_mode(el.attrib.get("val") or el.text)
 
-                    src = self._infer_source_from_playtype(self._linkplay_playtype) or self._infer_source_from_uri(av_uri or track_uri)
-                    if src:
-                        self._linkplay_source_name = src
-                        self._cached_fallback_image = None
-                        self._cached_media_image = None
+                    if saw_meta:
+                        # Prefer the metadata blob that actually contains LinkPlay audio tags.
+                        def _looks_useful(meta: str | None) -> bool:
+                            if not meta:
+                                return False
+                            s = str(meta)
+                            return any(k in s for k in ("rate_hz", "format_s", "bitrate", "DIDL-Lite"))
+
+                        chosen: str | None = None
+                        if _looks_useful(track_metadata):
+                            chosen = track_metadata
+                        elif _looks_useful(av_metadata):
+                            chosen = av_metadata
+                        else:
+                            chosen = track_metadata or av_metadata
+
+                        self._update_audio_quality_from_metadata(chosen)
+
+                    # Update inferred source after applying raw values.
+                    self._maybe_update_linkplay_source()
 
 
         elif (
@@ -1134,30 +1184,27 @@ class DlnaDmrEntity(MediaPlayerEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose LinkPlay source decision inputs."""
+        """Expose LinkPlay/WiiM diagnostics from AVTransport LastChange."""
         attrs: dict[str, Any] = dict(super().extra_state_attributes or {})
 
-        # Signals used to infer the active source
-        if self._linkplay_playtype is not None:
-            attrs["linkplay_playtype"] = self._linkplay_playtype  # <-- numeric only
+        # Raw fields used for source detection.
+        attrs["linkplay_playback_storage_medium"] = (
+            self._linkplay_playback_storage_medium or "-"
+        )
+        attrs["linkplay_current_track_uri"] = self._linkplay_current_track_uri or "-"
+        attrs["linkplay_avtransport_uri"] = self._linkplay_avtransport_uri or "-"
+        attrs["linkplay_track_source"] = self._linkplay_track_source or "-"
 
-        if self._linkplay_playmedium is not None:
-            attrs["linkplay_playmedium"] = self._linkplay_playmedium
-
-        if self._linkplay_track_uri_raw is not None:
-            attrs["linkplay_track_uri"] = self._linkplay_track_uri_raw
-
-        # What the integration inferred from the above
-        if self._linkplay_source_name is not None:
-            attrs["linkplay_source_inferred"] = self._linkplay_source_name
-
-        # Optional: keep them grouped too
-        media_extra = dict(attrs.get(ATTR_MEDIA_EXTRA) or {})
-        for k in ("linkplay_playtype", "linkplay_playmedium", "linkplay_track_uri", "linkplay_source_inferred"):
-            if k in attrs:
-                media_extra[k] = attrs[k]
-        if media_extra:
-            attrs[ATTR_MEDIA_EXTRA] = media_extra
+        # Audio quality (best-effort).
+        attrs["linkplay_audio_rate_hz"] = (
+            self._linkplay_audio_rate_hz if self._linkplay_audio_rate_hz is not None else "-"
+        )
+        attrs["linkplay_audio_format_bits"] = (
+            self._linkplay_audio_format_bits if self._linkplay_audio_format_bits is not None else "-"
+        )
+        attrs["linkplay_audio_bitrate_kbps"] = (
+            self._linkplay_audio_bitrate_kbps if self._linkplay_audio_bitrate_kbps is not None else "-"
+        )
 
         return attrs
 
@@ -1240,23 +1287,135 @@ class DlnaDmrEntity(MediaPlayerEntity):
         else:
             self._cached_repeat = RepeatMode.OFF
 
-    def _infer_source_from_playtype(self, playtype: int | str | None) -> str | None:
-        """Infer user-facing source name from LinkPlay/WiiM PlayType."""
-        if playtype is None:
-            return None
-        try:
-            pt = int(str(playtype).strip())
-        except (TypeError, ValueError):
-            return None
-        return PLAYTYPE_TO_SOURCE_UI.get(pt)
+    @staticmethod
+    def _normalize_lastchange_value(val: Any) -> str | None:
+        """Normalize a UPnP/LastChange value to a stripped string.
 
+        Treat None/empty/"NONE" (case-insensitive) as missing.
+        """
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        if s.strip().upper() in ("NONE", "UNKNOWN"):
+            return None
+        return s
+
+    def _update_audio_quality_from_metadata(self, metadata: str | None) -> None:
+        """Parse DIDL metadata for basic audio quality fields.
+
+        LinkPlay/WiiM firmwares embed DIDL-Lite XML inside CurrentTrackMetaData /
+        AVTransportURIMetaData inside LastChange. The XML is commonly HTML-escaped.
+
+        We keep this best-effort and robust: failures simply leave fields as None.
+        """
+        raw = self._normalize_lastchange_value(metadata)
+        if raw is None:
+            # Only clear if metadata was explicitly provided as empty/none.
+            self._linkplay_last_metadata = None
+            self._linkplay_audio_rate_hz = None
+            self._linkplay_audio_format_bits = None
+            self._linkplay_audio_bitrate_kbps = None
+            return
+
+        # Avoid repeated parsing if metadata hasn't changed.
+        if raw == self._linkplay_last_metadata:
+            return
+        self._linkplay_last_metadata = raw
+
+        # Some firmwares use placeholders.
+        if raw.lower() in ("not_implemented", "not implemented", "un_known", "unknown"):
+            self._linkplay_audio_rate_hz = None
+            self._linkplay_audio_format_bits = None
+            self._linkplay_audio_bitrate_kbps = None
+            return
+
+        # Unescape a couple of layers; different firmwares escape differently.
+        decoded = raw
+        for _ in range(2):
+            new_decoded = html.unescape(decoded)
+            if new_decoded == decoded:
+                break
+            decoded = new_decoded
+        decoded = decoded.strip()
+
+        # Try to parse as XML. If it fails, try to extract the DIDL-Lite fragment.
+        root: ET.Element | None = None
+        try:
+            root = ET.fromstring(decoded)
+        except Exception:  # noqa: BLE001
+            # Extract DIDL-Lite...
+            start = decoded.find("<DIDL-Lite")
+            end = decoded.rfind("</DIDL-Lite>")
+            if start != -1 and end != -1:
+                frag = decoded[start : end + len("</DIDL-Lite>")]
+                try:
+                    root = ET.fromstring(frag)
+                except Exception:  # noqa: BLE001
+                    root = None
+
+
+        if root is None:
+            # Regex fallback: some firmwares embed malformed XML but still include the audio tags.
+            def _re_int(pat: str) -> int | None:
+                mm = re.search(pat, decoded, flags=re.IGNORECASE | re.DOTALL)
+                if not mm:
+                    return None
+                try:
+                    return int(mm.group(1))
+                except Exception:
+                    return None
+
+            rate_hz = _re_int(r"rate_hz[^0-9]{0,50}([0-9]{4,6})")
+            bits = _re_int(r"format_s[^0-9]{0,50}([0-9]{1,3})")
+            bitrate = _re_int(r"bitrate[^0-9]{0,50}([0-9]{2,5})")
+
+            self._linkplay_audio_rate_hz = rate_hz
+            self._linkplay_audio_format_bits = bits
+            self._linkplay_audio_bitrate_kbps = bitrate
+            return
+
+        rate_hz: int | None = None
+        bits: int | None = None
+        bitrate: int | None = None
+        for el in root.iter():
+            name = self._localname(el.tag)
+            if name == "rate_hz" and el.text:
+                with contextlib.suppress(Exception):
+                    rate_hz = int(str(el.text).strip())
+            elif name == "format_s" and el.text:
+                with contextlib.suppress(Exception):
+                    bits = int(str(el.text).strip())
+            elif name == "bitrate" and el.text:
+                with contextlib.suppress(Exception):
+                    bitrate = int(str(el.text).strip())
+
+        self._linkplay_audio_rate_hz = rate_hz
+        self._linkplay_audio_format_bits = bits
+        self._linkplay_audio_bitrate_kbps = bitrate
+
+    def _infer_source_from_playback_storage_medium(self, medium: str | None) -> str | None:
+        """Infer UI source from PlaybackStorageMedium."""
+        m = self._normalize_lastchange_value(medium)
+        if not m:
+            return None
+
+        key = m.upper()
+        if key in LINKPLAY_PLAYBACK_STORAGE_MEDIUM_TO_SOURCE_UI:
+            return LINKPLAY_PLAYBACK_STORAGE_MEDIUM_TO_SOURCE_UI[key]
+
+        # Treat any *-NETWORK token as Wi-Fi (covers additional firmwares).
+        if key.endswith("-NETWORK"):
+            return "Wi-Fi"
+        if any(key.startswith(p) for p in LINKPLAY_NETWORK_TOKEN_PREFIXES):
+            return "Wi-Fi"
+
+        return None
 
     def _infer_source_from_uri(self, uri: str | None) -> str | None:
         """Infer the UI-visible source name from a LinkPlay/WiiM URI/token."""
-        if not uri:
-            return None
-
-        u = str(uri).strip()
+        u = self._normalize_lastchange_value(uri)
         if not u:
             return None
 
@@ -1264,23 +1423,21 @@ class DlnaDmrEntity(MediaPlayerEntity):
         uu = u.upper()
 
         # AirPlay uses a special token/track URI.
-        if ul == "wiimu_airplay" or "wiimu_airplay" in ul or "airplay" in ul:
+        if "wiimu_airplay" in ul:
             return "AirPlay"
 
-        # Physical inputs.
-        if uu in ("LINE-IN", "LINEIN") or ul in ("line-in", "linein", "aux", "analog"):
-            return "Line-In"
-        if uu in ("BLUETOOTH", "BT") or ul in ("bluetooth", "bt"):
-            return "Bluetooth"
-        if uu in ("OPTICAL",) or ul in ("optical",):
-            return "Optical"
-        if uu.startswith("HDMI") or "arc" in ul or ul in ("hdmi", "hdmi-arc", "hdmiarc"):
-            return "HDMI ARC"
+        # Some firmwares mirror PlaybackStorageMedium into URI fields.
+        if uu in LINKPLAY_PLAYBACK_STORAGE_MEDIUM_TO_SOURCE_UI:
+            return LINKPLAY_PLAYBACK_STORAGE_MEDIUM_TO_SOURCE_UI[uu]
 
-        # Network playback.
-        if ul.startswith("http://") or ul.startswith("https://"):
+        # Treat any *-NETWORK token as Wi-Fi.
+        if uu.endswith("-NETWORK"):
             return "Wi-Fi"
-        if uu.startswith("SONGLIST-") or uu in ("SONGLIST-NETWORK", "WIFI") or ul == "wifi":
+        if any(uu.startswith(p) for p in LINKPLAY_NETWORK_TOKEN_PREFIXES):
+            return "Wi-Fi"
+
+        # Network streams sometimes show up as full URLs.
+        if ul.startswith("http://") or ul.startswith("https://"):
             return "Wi-Fi"
 
         # Some firmwares report the switchmode token directly.
@@ -1288,6 +1445,39 @@ class DlnaDmrEntity(MediaPlayerEntity):
             return LINKPLAY_SOURCE_TOKEN_TO_UI[ul]
 
         return None
+
+    def _infer_current_linkplay_source(self) -> str | None:
+        """Infer the current source using LastChange-preferred signals."""
+        # 1) Prefer PlaybackStorageMedium.
+        if (src := self._infer_source_from_playback_storage_medium(self._linkplay_playback_storage_medium)) is not None:
+            return src
+
+        # 2) Fall back to URI fields.
+        if (src := self._infer_source_from_uri(self._linkplay_current_track_uri)) is not None:
+            return src
+        if (src := self._infer_source_from_uri(self._linkplay_avtransport_uri)) is not None:
+            return src
+
+        # 3) Best-effort: profile current_track_uri (still derived from the same AVTransport state).
+        if self._device:
+            uri = getattr(self._device, "current_track_uri", None)
+            if isinstance(uri, str):
+                if (src := self._infer_source_from_uri(uri)) is not None:
+                    return src
+
+        return None
+
+    def _maybe_update_linkplay_source(self) -> None:
+        """Update cached linkplay source name based on latest raw signals."""
+        src = self._infer_current_linkplay_source()
+        if not src:
+            return
+
+        if src != self._linkplay_source_name:
+            self._linkplay_source_name = src
+            # Source switch affects artwork.
+            self._cached_fallback_image = None
+            self._cached_media_image = None
 
     @property
     def source_list(self) -> list[str] | None:
@@ -1297,37 +1487,17 @@ class DlnaDmrEntity(MediaPlayerEntity):
     @property
     def source(self) -> str | None:
         """Return current input/source."""
-        # Best: PlayType (numeric source) if we have it.
-        if (src := self._infer_source_from_playtype(self._linkplay_playtype)) is not None:
+        if (src := self._infer_current_linkplay_source()) is not None:
             self._linkplay_source_name = src
             return src
 
-        # Next: if the device reports the switchmode token directly as TrackURI.
-        if self._device:
-            uri = getattr(self._device, "current_track_uri", None)
-            if isinstance(uri, str):
-                token = uri.strip()
-                token_key = token.lower()
-                if token_key in LINKPLAY_SOURCE_TOKEN_TO_UI:
-                    src = LINKPLAY_SOURCE_TOKEN_TO_UI.get(token_key, token)
-                    self._linkplay_source_name = src
-                    return src
-                if (src := self._infer_source_from_uri(token)) is not None:
-                    self._linkplay_source_name = src
-                    return src
-
-        # Then: event-derived cached source.
-        if self._linkplay_source_name:
-            return self._linkplay_source_name
-
-        # Fallback: infer from current track URI (e.g. URLs -> Wi-Fi).
-        return self._infer_source_from_uri(self.media_content_id)
+        return self._linkplay_source_name
 
     async def async_select_source(self, source: str) -> None:
         """Select input/source via LinkPlay HTTP API.
 
-        NOTE: "AirPlay" is a visibility-only pseudo-source and is treated as a
-        no-op here.
+        NOTE: "AirPlay" and "Multiroom (Secondary)" are visibility-only and are
+        treated as no-ops here.
         """
         if source not in LINKPLAY_SOURCE_LIST:
             raise HomeAssistantError(f"Unknown source: {source}")
@@ -1335,7 +1505,7 @@ class DlnaDmrEntity(MediaPlayerEntity):
         token = LINKPLAY_SOURCE_UI_TO_TOKEN.get(source)
         if token is None:
             # Visibility-only, don't try to force an input.
-            _LOGGER.debug("Ignoring select_source(AirPlay) for %s", self.name)
+            _LOGGER.debug("Ignoring select_source(%s) for %s", source, self.name)
             return
 
         await self._async_send_httpapi_command(f"setPlayerCmd:switchmode:{token}")
