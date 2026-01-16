@@ -49,6 +49,7 @@ def _humanize_track_source(val: Any) -> str:
         "CustomRadio": "Custom Radio",
         "Linkplay Radio": "Linkplay Radio",
         "vTuner": "vTuner",
+        "Radio Paradise2": "Radio Paradise",
     }
     if raw in known:
         return known[raw]
@@ -118,15 +119,18 @@ DESCRIPTIONS: tuple[DiagSensorDescription, ...] = (
     DiagSensorDescription(
         key="diag_source",
         name_suffix="Source",
+        icon="mdi:import",
         value_fn=lambda attrs: _safe_str(attrs.get("source")) or "-",
     ),
     DiagSensorDescription(
         key="diag_source_detail",
         name_suffix="Source Detail",
+        icon="mdi:playlist-music",
         value_fn=lambda attrs: _humanize_track_source(attrs.get("linkplay_track_source")),
     ),
     DiagSensorDescription(
         key="diag_audio_quality",
+        icon="mdi:waveform",
         name_suffix="Audio Quality",
         value_fn=_format_audio_quality,
     ),
