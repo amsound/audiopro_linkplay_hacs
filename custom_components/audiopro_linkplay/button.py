@@ -62,8 +62,8 @@ DESCRIPTIONS: tuple[LinkPlayButtonDescription, ...] = (
     LinkPlayButtonDescription(
         key="reboot",
         name="Reboot",
-        icon="mdi:restart",
-        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cached",
+        entity_category=EntityCategory.CONFIG,
     ),
 )
 
