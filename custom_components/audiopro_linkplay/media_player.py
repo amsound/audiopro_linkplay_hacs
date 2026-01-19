@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 import contextlib
 import html
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse
@@ -222,6 +223,9 @@ async def async_setup_entry(
         config_entry=entry,
     )
 
+    # Store a reference for other platforms (e.g. button) to call into.
+    hass.data.setdefault(f"{DOMAIN}_entities", {})[entry.entry_id] = entity
+
     async_add_entities([entity])
 
 
@@ -275,10 +279,18 @@ class DlnaDmrEntity(MediaPlayerEntity):
         self._attr_name = name
         self._event_addr = EventListenAddr(event_host, event_port, event_callback_url)
         self.poll_availability = poll_availability
+        # Allow HA to call async_update periodically when the user enables
+        # availability polling. This is also used as a safety net to
+        # reconnect/resubscribe after device reboots.
+        self._attr_should_poll = bool(poll_availability)
         self.location = location
         self.mac_address = mac_address
         self.browse_unfiltered = browse_unfiltered
         self._device_lock = asyncio.Lock()
+
+        # Short-lived reboot recovery loop (started by the reboot button).
+        self._unsub_reboot_recovery: CALLBACK_TYPE | None = None
+        self._reboot_recovery_deadline: float | None = None
 
         # Store the event handler we use for GENA subscriptions so we can
         # subscribe to vendor services (e.g. PlayQueue) in addition to the
@@ -629,7 +641,55 @@ class DlnaDmrEntity(MediaPlayerEntity):
                 await self._background_setup_task
             self._background_setup_task = None
 
+        # Stop any temporary recovery timers.
+        self._stop_reboot_recovery()
+
+        # Remove from cross-platform entity map (used by button platform).
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            self.hass.data.get(f"{DOMAIN}_entities", {}).pop(
+                self._config_entry.entry_id, None
+            )
+
         await self._device_disconnect()
+
+    def _in_reboot_recovery(self) -> bool:
+        """Return True if we're in a short-lived post-reboot recovery window."""
+        if self._reboot_recovery_deadline is None:
+            return False
+        return time.monotonic() < self._reboot_recovery_deadline
+
+    def async_start_reboot_recovery(self, *, seconds: int = 180) -> None:
+        """Start a short-lived reconnect/resubscribe loop after reboot.
+
+        This is intentionally lightweight and only active briefly. It helps
+        recover even if SSDP multicast is filtered and no events arrive.
+        """
+        self._reboot_recovery_deadline = time.monotonic() + float(seconds)
+        self.check_available = True
+        self._resubscribe_reconnect = True
+
+        # Kick an immediate refresh.
+        self.async_schedule_update_ha_state(True)
+
+        if self._unsub_reboot_recovery is not None:
+            return
+
+        async def _tick(_: datetime) -> None:
+            if not self._in_reboot_recovery():
+                self._stop_reboot_recovery()
+                return
+            self.async_schedule_update_ha_state(True)
+
+        # Poll HA update for a short window; does not call httpapi status.
+        self._unsub_reboot_recovery = async_track_time_interval(
+            self.hass, _tick, timedelta(seconds=5)
+        )
+
+    def _stop_reboot_recovery(self) -> None:
+        if self._unsub_reboot_recovery is not None:
+            self._unsub_reboot_recovery()
+            self._unsub_reboot_recovery = None
+        self._reboot_recovery_deadline = None
 
     async def async_ssdp_callback(
         self, info: SsdpServiceInfo, change: ssdp.SsdpChange
@@ -881,7 +941,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
             self._background_setup_task = None
 
         if not self._device:
-            if not self.poll_availability:
+            # Only attempt reconnects when explicitly enabled (poll_availability)
+            # or during a short-lived reboot recovery window.
+            if not (self.poll_availability or self._in_reboot_recovery()):
                 return
             try:
                 await self._device_connect(self.location)
@@ -912,6 +974,9 @@ class DlnaDmrEntity(MediaPlayerEntity):
         # profile object even when eventing is flaky.
         if isinstance(getattr(self._device, "current_track_uri", None), str):
             self._linkplay_current_track_uri = self._device.current_track_uri
+
+        # If we made it this far, the device is responsive again.
+        self._stop_reboot_recovery()
 
     def _on_event(
         self, service: UpnpService, state_variables: Sequence[UpnpStateVariable]
