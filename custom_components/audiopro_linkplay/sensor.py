@@ -125,12 +125,12 @@ DESCRIPTIONS: tuple[DiagSensorDescription, ...] = (
     DiagSensorDescription(
         key="diag_source_detail",
         name_suffix="Source Detail",
-        icon="mdi:playlist-music",
+        icon="mdi:import",
         value_fn=lambda attrs: _humanize_track_source(attrs.get("linkplay_track_source")),
     ),
     DiagSensorDescription(
         key="diag_audio_quality",
-        icon="mdi:waveform",
+        icon="mdi:sine-wave",
         name_suffix="Audio Quality",
         value_fn=_format_audio_quality,
     ),
