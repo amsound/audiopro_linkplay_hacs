@@ -14,6 +14,14 @@ PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.SENSOR, Platform.BU
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up audiopro_linkplay from a config entry."""
     LOGGER.debug("Setting up config entry: %s", entry.unique_id)
+
+    async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Handle options update: reload to apply changes immediately."""
+        LOGGER.debug("Options updated for %s; reloading entry", entry.unique_id)
+        await hass.config_entries.async_reload(entry.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
